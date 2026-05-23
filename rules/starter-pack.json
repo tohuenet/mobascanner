@@ -1,0 +1,145 @@
+[
+  {
+    "id": "wp-readme-version",
+    "name": "WordPress version disclosed via /readme.html",
+    "severity": "low",
+    "description": "WordPress ships a /readme.html file containing the running version. Removing it forces attackers to fingerprint by harder paths.",
+    "ruleId": "wordpress/readme-version",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      {
+        "method": "GET",
+        "path": "/readme.html",
+        "match": {
+          "status": [200],
+          "body_contains": ["WordPress"]
+        }
+      }
+    ],
+    "remediation": "Delete /readme.html on every deployment, or block it at the web server.",
+    "references": ["https://owasp.org/www-project-secure-headers/"]
+  },
+  {
+    "id": "drupal-changelog",
+    "name": "Drupal CHANGELOG.txt exposed",
+    "severity": "low",
+    "description": "Drupal ships a CHANGELOG.txt that often discloses the current version. Combined with a known-vulnerable version, attackers go straight to the matching exploit.",
+    "ruleId": "drupal/changelog",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/CHANGELOG.txt", "match": { "status": [200], "body_contains": ["Drupal"] } }
+    ],
+    "remediation": "Block /CHANGELOG.txt on Drupal sites at the web server."
+  },
+  {
+    "id": "spring-actuator-env",
+    "name": "Spring Boot Actuator /actuator/env exposed",
+    "severity": "high",
+    "description": "Spring Boot Actuator's /actuator/env endpoint discloses every environment variable AND application property — including database URLs, API keys, and secrets.",
+    "ruleId": "spring/actuator-env",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/actuator/env", "match": { "status": [200], "body_contains": ["propertySources"] } },
+      { "method": "GET", "path": "/env", "match": { "status": [200], "body_contains": ["propertySources"] } }
+    ],
+    "remediation": "Restrict /actuator to internal networks only, OR set `management.endpoints.web.exposure.include=health,info` to expose only safe endpoints.",
+    "references": ["https://docs.spring.io/spring-boot/docs/current/reference/html/actuator.html"]
+  },
+  {
+    "id": "spring-actuator-heapdump",
+    "name": "Spring Boot Actuator /actuator/heapdump exposed",
+    "severity": "critical",
+    "description": "Public /actuator/heapdump downloads a JVM heap snapshot — contains in-memory passwords, JWT keys, session tokens.",
+    "ruleId": "spring/actuator-heapdump",
+    "cwe": ["CWE-538"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/actuator/heapdump", "match": { "status": [200], "header": { "name": "content-type", "contains": "octet-stream" } } }
+    ],
+    "remediation": "Disable the heapdump endpoint in production (`management.endpoint.heapdump.enabled=false`)."
+  },
+  {
+    "id": "phpinfo-exposed",
+    "name": "PHP info() page exposed",
+    "severity": "medium",
+    "description": "phpinfo() dumps PHP version, loaded modules, environment variables, file paths, build flags. Source for many CVE lookups.",
+    "ruleId": "php/phpinfo",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/phpinfo.php", "match": { "status": [200], "body_contains": ["PHP Version"] } },
+      { "method": "GET", "path": "/info.php", "match": { "status": [200], "body_contains": ["PHP Version"] } },
+      { "method": "GET", "path": "/test.php", "match": { "status": [200], "body_contains": ["PHP Version"] } }
+    ],
+    "remediation": "Delete or block all phpinfo() pages from production deployments."
+  },
+  {
+    "id": "swagger-ui-public",
+    "name": "Swagger UI / OpenAPI Explorer publicly accessible",
+    "severity": "medium",
+    "description": "Swagger UI exposes the full API contract — every endpoint, parameter, schema. Useful for legitimate users but also a recon goldmine for attackers.",
+    "ruleId": "api-docs/swagger",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/swagger-ui.html", "match": { "status": [200], "body_contains": ["Swagger UI"] } },
+      { "method": "GET", "path": "/swagger-ui/index.html", "match": { "status": [200], "body_contains": ["Swagger UI"] } },
+      { "method": "GET", "path": "/swagger.json", "match": { "status": [200], "body_contains": ["openapi"] } },
+      { "method": "GET", "path": "/openapi.json", "match": { "status": [200], "body_contains": ["openapi"] } },
+      { "method": "GET", "path": "/v3/api-docs", "match": { "status": [200], "body_contains": ["openapi"] } }
+    ],
+    "remediation": "If the API is internal, gate Swagger UI behind auth. Public APIs should still strip server/host information from the spec."
+  },
+  {
+    "id": "prometheus-metrics",
+    "name": "Prometheus /metrics endpoint public",
+    "severity": "medium",
+    "description": "Prometheus metrics often leak request counts, error rates, JVM internals, and sometimes labels containing user IDs / IP addresses.",
+    "ruleId": "monitoring/prometheus",
+    "cwe": ["CWE-200"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/metrics", "match": { "status": [200], "body_contains": ["# HELP"] } }
+    ],
+    "remediation": "Bind /metrics to localhost or restrict by IP allow-list."
+  },
+  {
+    "id": "git-head",
+    "name": "Git directory exposed (.git/HEAD reachable)",
+    "severity": "critical",
+    "description": "Apache configs occasionally serve .git/* — attackers can reconstruct the entire source tree using git-dumper.",
+    "ruleId": "vcs/git-exposed",
+    "cwe": ["CWE-538"],
+    "owasp": ["A05:2021"],
+    "targets": [
+      { "method": "GET", "path": "/.git/HEAD", "match": { "status": [200], "body_regex": "^ref:\\s+refs/" } }
+    ],
+    "remediation": "Block /.git/* at the web server. Don't deploy with .git in the docroot."
+  },
+  {
+    "id": "wp-debug-log",
+    "name": "WordPress debug.log exposed",
+    "severity": "high",
+    "description": "WordPress writes WP_DEBUG output to wp-content/debug.log — if served, leaks query errors, stack traces, plugin internals.",
+    "ruleId": "wordpress/debug-log",
+    "cwe": ["CWE-200"],
+    "targets": [
+      { "method": "GET", "path": "/wp-content/debug.log", "match": { "status": [200], "header": { "name": "content-type", "contains": "text" } } }
+    ],
+    "remediation": "Disable WP_DEBUG_LOG, or set it to a path outside the docroot."
+  },
+  {
+    "id": "actuator-base",
+    "name": "Spring Boot Actuator index reachable",
+    "severity": "low",
+    "description": "Actuator landing page reveals which sub-endpoints are exposed. Use it as a guide to /env, /heapdump, /trace, /loggers — each of which has its own severity.",
+    "ruleId": "spring/actuator-base",
+    "targets": [
+      { "method": "GET", "path": "/actuator", "match": { "status": [200], "body_contains": ["_links"] } },
+      { "method": "GET", "path": "/actuator/", "match": { "status": [200], "body_contains": ["_links"] } }
+    ]
+  }
+]

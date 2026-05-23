@@ -1,0 +1,50 @@
+# moba-scanner — single-service compose for the all-batteries image.
+#
+# Quick start:
+#   docker compose up --build
+# Then open http://localhost:3000.
+#
+# To scan a service running on YOUR HOST, target host.docker.internal:<port>
+# (the extra_hosts mapping below makes that work on Linux too).
+#
+# Snyk needs auth once:
+#   docker compose exec moba-scanner snyk auth
+
+services:
+  moba-scanner:
+    build: .
+    image: moba-scanner:latest
+    ports:
+      # Bump the *host* side if 3000 is already taken (e.g. MOBA_HOST_PORT=3030).
+      # The app inside the container always listens on 3000.
+      - "${MOBA_HOST_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+    # Persist scan history (lib/store.ts writes JSON files under /app/data).
+    volumes:
+      - ./data:/app/data
+    # Lets the container reach services bound to your host's loopback.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+    # ── Tips (uncomment if you need them) ────────────────────────────────────
+    # network_mode: host
+    #   Linux only — drops Docker's NAT so 127.0.0.1 inside the container IS
+    #   the host. Easiest way to scan many host-local services at once. Trades
+    #   the published-port mapping above; reach the UI via http://localhost:3000.
+
+    # cap_add:
+    #   - NET_RAW
+    #   - NET_ADMIN
+    #   Needed for masscan / naabu raw-socket modes.
+
+  # ── Optional sidecar: OWASP ZAP daemon ──────────────────────────────────────
+  # Uncomment + run `docker compose up zap`. In the moba UI, pick the ZAP
+  # scanner and set options.zapBase = http://zap:8090
+  # zap:
+  #   image: zaproxy/zap-stable:latest
+  #   command: zap.sh -daemon -host 0.0.0.0 -port 8090 -config api.disablekey=true
+  #   ports:
+  #     - "8090:8090"
+  #   restart: unless-stopped

@@ -1,0 +1,356 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   Material 3 (Material You) Design Tokens — Light / Dark
+   Plus Liquid Glass surface utilities
+   ============================================================================ */
+
+:root {
+  /* M3 Primary (violet/indigo-leaning, mapped to "moba" identity) */
+  --md-primary:               oklch(0.55 0.16 290);
+  --md-on-primary:            oklch(1 0 0);
+  --md-primary-container:     oklch(0.92 0.05 290);
+  --md-on-primary-container:  oklch(0.18 0.10 290);
+
+  /* M3 Secondary */
+  --md-secondary:             oklch(0.55 0.06 280);
+  --md-on-secondary:          oklch(1 0 0);
+  --md-secondary-container:   oklch(0.92 0.03 280);
+  --md-on-secondary-container:oklch(0.18 0.04 280);
+
+  /* M3 Tertiary (warm pink) */
+  --md-tertiary:              oklch(0.60 0.10 20);
+  --md-on-tertiary:           oklch(1 0 0);
+  --md-tertiary-container:    oklch(0.92 0.04 20);
+  --md-on-tertiary-container: oklch(0.18 0.05 20);
+
+  /* M3 Error */
+  --md-error:                 oklch(0.55 0.20 27);
+  --md-on-error:              oklch(1 0 0);
+  --md-error-container:       oklch(0.92 0.08 27);
+  --md-on-error-container:    oklch(0.18 0.13 27);
+
+  /* M3 Severity (custom, beyond M3 spec) */
+  --md-severity-critical:     oklch(0.55 0.22 12);
+  --md-severity-high:         oklch(0.62 0.20 35);
+  --md-severity-medium:       oklch(0.72 0.16 80);
+  --md-severity-low:          oklch(0.65 0.13 200);
+  --md-severity-info:         oklch(0.68 0.05 260);
+
+  /* M3 Neutral — light surface tones */
+  --md-background:            oklch(0.985 0.005 290);
+  --md-on-background:         oklch(0.18 0.02 290);
+  --md-surface:               oklch(0.985 0.005 290);
+  --md-on-surface:            oklch(0.18 0.02 290);
+  --md-surface-dim:           oklch(0.92 0.01 290);
+  --md-surface-bright:        oklch(0.99 0.005 290);
+  --md-surface-container-lowest: oklch(1 0 0);
+  --md-surface-container-low:    oklch(0.97 0.008 290);
+  --md-surface-container:        oklch(0.95 0.01 290);
+  --md-surface-container-high:   oklch(0.93 0.012 290);
+  --md-surface-container-highest:oklch(0.91 0.014 290);
+  --md-surface-variant:       oklch(0.90 0.02 290);
+  --md-on-surface-variant:    oklch(0.40 0.03 290);
+  --md-outline:               oklch(0.65 0.02 290);
+  --md-outline-variant:       oklch(0.85 0.02 290);
+
+  /* Inverse / scrim */
+  --md-inverse-surface:       oklch(0.25 0.02 290);
+  --md-inverse-on-surface:    oklch(0.95 0.005 290);
+  --md-inverse-primary:       oklch(0.78 0.10 290);
+  --md-scrim:                 oklch(0 0 0);
+  --md-shadow:                oklch(0 0 0);
+
+  /* Liquid Glass — light */
+  --lg-tint:                  255 255 255;
+  --lg-tint-alpha:            0.55;
+  --lg-edge:                  255 255 255;
+  --lg-edge-alpha:            0.7;
+  --lg-shadow:                15 23 42;
+  --lg-shadow-alpha:          0.08;
+
+  /* Shape (M3 corner scale) */
+  --md-shape-xs: 4px;
+  --md-shape-sm: 8px;
+  --md-shape-md: 12px;
+  --md-shape-lg: 16px;
+  --md-shape-xl: 28px;
+  --md-shape-full: 9999px;
+
+  /* State layer opacities */
+  --md-state-hover:   0.08;
+  --md-state-focus:   0.10;
+  --md-state-pressed: 0.10;
+  --md-state-drag:    0.16;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --md-primary:               oklch(0.78 0.12 290);
+    --md-on-primary:            oklch(0.18 0.10 290);
+    --md-primary-container:     oklch(0.32 0.12 290);
+    --md-on-primary-container:  oklch(0.92 0.05 290);
+
+    --md-secondary:             oklch(0.80 0.05 280);
+    --md-on-secondary:          oklch(0.18 0.04 280);
+    --md-secondary-container:   oklch(0.32 0.05 280);
+    --md-on-secondary-container:oklch(0.92 0.03 280);
+
+    --md-tertiary:              oklch(0.82 0.08 20);
+    --md-on-tertiary:           oklch(0.18 0.05 20);
+    --md-tertiary-container:    oklch(0.35 0.08 20);
+    --md-on-tertiary-container: oklch(0.92 0.04 20);
+
+    --md-error:                 oklch(0.78 0.18 27);
+    --md-on-error:              oklch(0.18 0.13 27);
+    --md-error-container:       oklch(0.35 0.16 27);
+    --md-on-error-container:    oklch(0.92 0.08 27);
+
+    --md-severity-critical:     oklch(0.70 0.22 12);
+    --md-severity-high:         oklch(0.78 0.18 35);
+    --md-severity-medium:       oklch(0.82 0.15 80);
+    --md-severity-low:          oklch(0.78 0.13 200);
+    --md-severity-info:         oklch(0.78 0.04 260);
+
+    --md-background:            oklch(0.14 0.02 290);
+    --md-on-background:         oklch(0.92 0.01 290);
+    --md-surface:               oklch(0.14 0.02 290);
+    --md-on-surface:            oklch(0.92 0.01 290);
+    --md-surface-dim:           oklch(0.12 0.02 290);
+    --md-surface-bright:        oklch(0.22 0.02 290);
+    --md-surface-container-lowest: oklch(0.10 0.02 290);
+    --md-surface-container-low:    oklch(0.16 0.02 290);
+    --md-surface-container:        oklch(0.18 0.02 290);
+    --md-surface-container-high:   oklch(0.21 0.02 290);
+    --md-surface-container-highest:oklch(0.24 0.02 290);
+    --md-surface-variant:       oklch(0.30 0.02 290);
+    --md-on-surface-variant:    oklch(0.78 0.02 290);
+    --md-outline:               oklch(0.55 0.02 290);
+    --md-outline-variant:       oklch(0.30 0.02 290);
+
+    --md-inverse-surface:       oklch(0.92 0.01 290);
+    --md-inverse-on-surface:    oklch(0.18 0.02 290);
+    --md-inverse-primary:       oklch(0.50 0.16 290);
+    --md-scrim:                 oklch(0 0 0);
+
+    --lg-tint:                  20 18 30;
+    --lg-tint-alpha:            0.55;
+    --lg-edge:                  255 255 255;
+    --lg-edge-alpha:            0.18;
+    --lg-shadow:                0 0 0;
+    --lg-shadow-alpha:          0.45;
+  }
+}
+
+/* ============================================================================
+   Tailwind v4 theme — expose tokens as Tailwind utilities (e.g. bg-primary)
+   ============================================================================ */
+@theme inline {
+  --color-background:         var(--md-background);
+  --color-foreground:         var(--md-on-background);
+  --color-primary:            var(--md-primary);
+  --color-on-primary:         var(--md-on-primary);
+  --color-primary-container:  var(--md-primary-container);
+  --color-on-primary-container: var(--md-on-primary-container);
+  --color-secondary:          var(--md-secondary);
+  --color-on-secondary:       var(--md-on-secondary);
+  --color-secondary-container:var(--md-secondary-container);
+  --color-on-secondary-container: var(--md-on-secondary-container);
+  --color-tertiary:           var(--md-tertiary);
+  --color-on-tertiary:        var(--md-on-tertiary);
+  --color-tertiary-container: var(--md-tertiary-container);
+  --color-on-tertiary-container: var(--md-on-tertiary-container);
+  --color-error:              var(--md-error);
+  --color-on-error:           var(--md-on-error);
+  --color-error-container:    var(--md-error-container);
+  --color-on-error-container: var(--md-on-error-container);
+  --color-surface:            var(--md-surface);
+  --color-on-surface:         var(--md-on-surface);
+  --color-surface-dim:        var(--md-surface-dim);
+  --color-surface-bright:     var(--md-surface-bright);
+  --color-surface-container-lowest: var(--md-surface-container-lowest);
+  --color-surface-container-low:    var(--md-surface-container-low);
+  --color-surface-container:        var(--md-surface-container);
+  --color-surface-container-high:   var(--md-surface-container-high);
+  --color-surface-container-highest:var(--md-surface-container-highest);
+  --color-surface-variant:    var(--md-surface-variant);
+  --color-on-surface-variant: var(--md-on-surface-variant);
+  --color-outline:            var(--md-outline);
+  --color-outline-variant:    var(--md-outline-variant);
+  --color-inverse-surface:    var(--md-inverse-surface);
+  --color-inverse-on-surface: var(--md-inverse-on-surface);
+  --color-inverse-primary:    var(--md-inverse-primary);
+  --color-sev-critical:       var(--md-severity-critical);
+  --color-sev-high:           var(--md-severity-high);
+  --color-sev-medium:         var(--md-severity-medium);
+  --color-sev-low:            var(--md-severity-low);
+  --color-sev-info:           var(--md-severity-info);
+
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --radius-xs:   var(--md-shape-xs);
+  --radius-sm:   var(--md-shape-sm);
+  --radius-md:   var(--md-shape-md);
+  --radius-lg:   var(--md-shape-lg);
+  --radius-xl:   var(--md-shape-xl);
+  --radius-full: var(--md-shape-full);
+}
+
+/* ============================================================================
+   Base layer
+   ============================================================================ */
+html, body { background: var(--md-background); color: var(--md-on-background); }
+body {
+  background:
+    radial-gradient(60% 50% at 12% -5%, color-mix(in oklab, var(--md-primary) 18%, transparent) 0%, transparent 70%),
+    radial-gradient(50% 40% at 95% 0%,  color-mix(in oklab, var(--md-tertiary) 18%, transparent) 0%, transparent 70%),
+    radial-gradient(50% 35% at 50% 100%, color-mix(in oklab, var(--md-secondary) 18%, transparent) 0%, transparent 70%),
+    var(--md-background);
+  color: var(--md-on-background);
+  font-family: var(--font-sans), -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* M3 typography scale */
+.md-display-l { font-size: 3.5rem;   line-height: 4rem;   letter-spacing: -0.015em; font-weight: 400; }
+.md-display-m { font-size: 2.75rem;  line-height: 3.25rem; letter-spacing: -0.01em;  font-weight: 400; }
+.md-display-s { font-size: 2.25rem;  line-height: 2.75rem; letter-spacing: -0.005em; font-weight: 400; }
+.md-headline-l{ font-size: 2rem;     line-height: 2.5rem;  font-weight: 400; }
+.md-headline-m{ font-size: 1.75rem;  line-height: 2.25rem; font-weight: 400; }
+.md-headline-s{ font-size: 1.5rem;   line-height: 2rem;    font-weight: 400; }
+.md-title-l   { font-size: 1.375rem; line-height: 1.75rem; font-weight: 500; }
+.md-title-m   { font-size: 1rem;     line-height: 1.5rem;  font-weight: 500; letter-spacing: 0.009em; }
+.md-title-s   { font-size: 0.875rem; line-height: 1.25rem; font-weight: 500; letter-spacing: 0.007em; }
+.md-body-l    { font-size: 1rem;     line-height: 1.5rem;  font-weight: 400; letter-spacing: 0.031em; }
+.md-body-m    { font-size: 0.875rem; line-height: 1.25rem; font-weight: 400; letter-spacing: 0.018em; }
+.md-body-s    { font-size: 0.75rem;  line-height: 1rem;    font-weight: 400; letter-spacing: 0.025em; }
+.md-label-l   { font-size: 0.875rem; line-height: 1.25rem; font-weight: 500; letter-spacing: 0.007em; }
+.md-label-m   { font-size: 0.75rem;  line-height: 1rem;    font-weight: 500; letter-spacing: 0.04em; }
+.md-label-s   { font-size: 0.6875rem;line-height: 1rem;    font-weight: 500; letter-spacing: 0.045em; }
+
+/* ============================================================================
+   Liquid Glass surface — translucent, blurred, with subtle edge highlight.
+   Layered with M3 surface color so contrast targets are still met.
+   ============================================================================ */
+.glass {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(var(--lg-edge) / 0.10) 0%,
+      rgba(var(--lg-tint)  / var(--lg-tint-alpha)) 6%,
+      rgba(var(--lg-tint)  / var(--lg-tint-alpha)) 100%
+    );
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+  border: 1px solid rgba(var(--lg-edge) / var(--lg-edge-alpha));
+  box-shadow:
+    inset 0 1px 0 0 rgba(var(--lg-edge) / 0.55),
+    0 4px 16px -8px rgba(var(--lg-shadow) / var(--lg-shadow-alpha));
+  border-radius: var(--md-shape-lg);
+}
+
+.glass-strong {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(var(--lg-edge) / 0.12) 0%,
+      rgba(var(--lg-tint)  / 0.82) 6%,
+      rgba(var(--lg-tint)  / 0.82) 100%
+    );
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(var(--lg-edge) / 0.65);
+  box-shadow:
+    inset 0 1px 0 0 rgba(var(--lg-edge) / 0.6),
+    0 12px 32px -16px rgba(var(--lg-shadow) / calc(var(--lg-shadow-alpha) * 1.4));
+  border-radius: var(--md-shape-lg);
+}
+
+.glass-thin {
+  background:
+    linear-gradient(
+      180deg,
+      rgba(var(--lg-edge) / 0.08) 0%,
+      rgba(var(--lg-tint)  / 0.42) 6%,
+      rgba(var(--lg-tint)  / 0.42) 100%
+    );
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  border: 1px solid rgba(var(--lg-edge) / 0.35);
+  border-radius: var(--md-shape-md);
+}
+
+@media (prefers-reduced-motion: reduce), (max-resolution: 1.5dppx) {
+  /* Some renderers (CI, headless screenshot) struggle with stacked backdrop-filter.
+     Drop the blur in those contexts so the UI still paints in a reasonable time. */
+  .glass, .glass-strong, .glass-thin {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* M3 state layer — apply on top of any tinted button/card. */
+.state-layer { position: relative; isolation: isolate; }
+.state-layer::after {
+  content: "";
+  position: absolute; inset: 0;
+  border-radius: inherit;
+  background: currentColor;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+.state-layer:hover::after  { opacity: var(--md-state-hover); }
+.state-layer:focus-visible::after { opacity: var(--md-state-focus); }
+.state-layer:active::after { opacity: var(--md-state-pressed); }
+
+/* M3 ripple (lightweight, CSS-only) */
+@keyframes md-ripple {
+  0%   { transform: scale(0);   opacity: 0.35; }
+  100% { transform: scale(2.5); opacity: 0;    }
+}
+
+/* Severity dot */
+.sev-dot { width: 0.5rem; height: 0.5rem; border-radius: 9999px; box-shadow: 0 0 0 4px color-mix(in oklab, currentColor 18%, transparent); }
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Animated stripe for in-progress bars */
+@keyframes stripe-move {
+  0%   { background-position: 0 0; }
+  100% { background-position: 40px 0; }
+}
+.stripe-anim {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(var(--lg-edge) / 0.35) 0 8px,
+    transparent 8px 20px
+  );
+  animation: stripe-move 1.2s linear infinite;
+}
+
+/* Scrollbar (subtle, M3 outline-variant) */
+* { scrollbar-width: thin; scrollbar-color: var(--md-outline-variant) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--md-outline-variant); border-radius: 9999px; border: 2px solid transparent; background-clip: padding-box; }
+*::-webkit-scrollbar-thumb:hover { background: var(--md-outline); background-clip: padding-box; border: 2px solid transparent; }
+
+/* Selection */
+::selection { background: color-mix(in oklab, var(--md-primary) 35%, transparent); color: var(--md-on-primary-container); }
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid var(--md-primary);
+  outline-offset: 2px;
+  border-radius: inherit;
+}
+
+/* Code blocks */
+.mono { font-family: var(--font-mono), ui-monospace, monospace; }

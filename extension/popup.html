@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>moba-scanner</title>
+<style>
+  body { font-family: system-ui, sans-serif; width: 320px; padding: 16px; margin: 0; }
+  h1 { font-size: 1.1em; margin: 0 0 0.5em 0; }
+  label { font-size: 0.85em; color: #666; }
+  input { width: 100%; padding: 6px 8px; margin-bottom: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: ui-monospace, monospace; font-size: 0.9em; }
+  button { width: 100%; padding: 10px; background: linear-gradient(135deg, #6750a4, #7d5260); color: #fff; border: 0; border-radius: 6px; cursor: pointer; font-size: 0.95em; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { font-size: 0.85em; margin-top: 12px; padding: 8px; border-radius: 4px; }
+  .ok { background: #f0fdf4; color: #166534; }
+  .err { background: #fef2f2; color: #991b1b; }
+</style></head><body>
+<h1>Send to moba-scanner</h1>
+<label>moba-scanner URL</label>
+<input id="endpoint" value="http://localhost:3000">
+<label>Preset</label>
+<select id="preset" style="width:100%;padding:6px;margin-bottom:8px">
+  <option value="quick">Quick</option>
+  <option value="bug-bounty" selected>Bug-bounty</option>
+  <option value="pentest-full">Full pentest</option>
+  <option value="compliance">Compliance</option>
+</select>
+<button id="capture">Capture this tab + start scan</button>
+<div id="status"></div>
+<script src="popup.js"></script>
+</body></html>

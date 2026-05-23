@@ -1,0 +1,109 @@
+name: moba-scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "URL or git repo to scan"
+        required: true
+      preset:
+        description: "Scanner preset"
+        required: false
+        default: "bug-bounty"
+        type: choice
+        options: [quick, bug-bounty, pentest-full, compliance]
+      kind:
+        description: "web or source"
+        required: false
+        default: "web"
+        type: choice
+        options: [web, source]
+  pull_request:
+    paths:
+      - "**/*.ts"
+      - "**/*.tsx"
+      - "package.json"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install moba-scanner
+        run: |
+          git clone --depth 1 https://github.com/local/moba-scanner /tmp/moba
+          cd /tmp/moba
+          npm ci
+
+      - name: Build scanner
+        working-directory: /tmp/moba
+        run: npm run build
+
+      - name: Start scanner in background
+        working-directory: /tmp/moba
+        run: |
+          nohup npm start -- -p 3939 > /tmp/moba.log 2>&1 &
+          for i in {1..30}; do
+            curl -s http://127.0.0.1:3939/api/tools && break
+            sleep 1
+          done
+
+      - name: Kick off scan
+        id: scan
+        run: |
+          KIND="${{ github.event.inputs.kind || 'source' }}"
+          if [ "$KIND" = "source" ]; then
+            TARGET="$GITHUB_WORKSPACE"
+            TARGET_TYPE="local"
+          else
+            TARGET="${{ github.event.inputs.target }}"
+            TARGET_TYPE="url"
+          fi
+          PRESET="${{ github.event.inputs.preset || 'bug-bounty' }}"
+          ENABLED=$(curl -s http://127.0.0.1:3939/api/presets | jq -r ".presets[\"$PRESET\"].enabled | @json")
+          ID=$(curl -s -X POST http://127.0.0.1:3939/api/scans \
+            -H 'Content-Type: application/json' \
+            -d "{\"kind\":\"$KIND\",\"target\":{\"value\":\"$TARGET\",\"type\":\"$TARGET_TYPE\"},\"selection\":{\"enabled\":$ENABLED}}" \
+            | jq -r .id)
+          echo "scan_id=$ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for scan to finish
+        run: |
+          while :; do
+            STATUS=$(curl -s http://127.0.0.1:3939/api/scans/${{ steps.scan.outputs.scan_id }} | jq -r .scan.status)
+            [ "$STATUS" = "completed" ] && break
+            [ "$STATUS" = "failed" ] && exit 1
+            sleep 5
+          done
+
+      - name: Download SARIF
+        run: |
+          curl -s -o moba.sarif http://127.0.0.1:3939/api/scans/${{ steps.scan.outputs.scan_id }}/sarif
+
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: moba.sarif
+          category: moba-scanner
+
+      - name: Quality gate (fail on new critical/high)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Compare with last scan on main (out of scope for this minimal example).
+          CRIT=$(curl -s http://127.0.0.1:3939/api/scans/${{ steps.scan.outputs.scan_id }} | jq '.scan.counts.critical')
+          HIGH=$(curl -s http://127.0.0.1:3939/api/scans/${{ steps.scan.outputs.scan_id }} | jq '.scan.counts.high')
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::$CRIT critical findings"
+            exit 1
+          fi
+          echo "Critical: $CRIT, High: $HIGH"
