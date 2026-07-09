@@ -59,6 +59,8 @@ import { oobInteractshScanner } from "./web/oob-interactsh";
 import { virusTotalScanner, shodanScanner } from "./web/threat-intel";
 import { censysScanner, abuseIpDbScanner, greyNoiseScanner } from "./web/threat-intel-extra";
 import { domXssScanner } from "./web/dom-xss";
+import { spaCrawlerScanner } from "./web/spa-crawler";
+import { queryFuzzerScanner } from "./web/query-fuzzer";
 
 // Web — external CLI / API
 import { nucleiScanner } from "./web/nuclei";
@@ -174,6 +176,8 @@ export function registerAllScanners(): void {
   registerScanner(greyNoiseScanner);
   // headless browser
   registerScanner(domXssScanner);
+  registerScanner(spaCrawlerScanner);
+  registerScanner(queryFuzzerScanner);
 
   // Web — external
   registerScanner(nucleiScanner);

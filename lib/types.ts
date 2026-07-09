@@ -62,6 +62,20 @@ export interface Finding {
     by?: string;
     at?: number;
   };
+  /**
+   * Set only on synthesized correlation findings (scannerId "correlation").
+   * First-class, optional link back to the scans/findings this was joined
+   * from — non-breaking, everything else ignores it.
+   */
+  correlation?: {
+    projectId?: string;
+    /** Scan ids that contributed the underlying findings. */
+    scanIds: string[];
+    /** How the join was made. */
+    join: "cve" | "chain" | "version";
+    /** Ids of the contributing findings (same as evidence.contributingFindings). */
+    contributes: string[];
+  };
   createdAt: number;
 }
 
@@ -120,6 +134,33 @@ export interface Scan {
   /** Free-form metadata: user agent, repo info, etc. */
   meta?: Record<string, unknown>;
   errorMessage?: string;
+}
+
+/**
+ * A member scan attached to a Project — a denormalized pointer that carries
+ * enough (kind + target) to render the project without re-reading each scan.
+ */
+export interface ProjectMember {
+  scanId: string;
+  kind: ScanKind;
+  /** The scan's target value at attach time (host/url or repo). */
+  target: string;
+  addedAt: number;
+}
+
+/**
+ * An asset group linking a web (DAST) scan of an app to a source (SAST/SCA)
+ * scan of its repo, so findings can be correlated across surfaces. This is the
+ * unit the Correlation & Confirmation engine operates over.
+ */
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: number;
+  /** Optional canonical targets, used for auto-suggest / display. */
+  targets?: { host?: string; repo?: string };
+  members: ProjectMember[];
+  meta?: Record<string, unknown>;
 }
 
 export interface ToolInfo {

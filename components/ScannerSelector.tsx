@@ -1,12 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Switch, Chip, SeverityBadge } from "./ui/Primitives";
+import { useEffect, useMemo, useState } from "react";
+import { Switch, Chip, SeverityBadge, ToolStatusBadge } from "./ui/Primitives";
+import { SetupChecklist } from "./auth/SetupChecklist";
 import type { ToolInfo } from "@/lib/types";
 
 export interface ScannerSelectorState {
   enabled: Record<string, boolean>;
 }
+
+/** Scanners that need the Chromium binary installed. Drives the inline
+ *  setup-hint shown beneath the selector when any of these are enabled. */
+const PLAYWRIGHT_SCANNERS = new Set(["web.spa-crawler", "web.dom-xss"]);
 
 export function ScannerSelector({
   kind,
@@ -21,8 +26,10 @@ export function ScannerSelector({
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    // `loading` already initializes to true, so we don't setState synchronously
+    // here (this component is mounted per-route, so `kind` never changes without
+    // a remount). Avoids the react-hooks cascading-render lint error.
     let abort = false;
-    setLoading(true);
     fetch("/api/tools")
       .then((r) => r.json())
       .then((data) => {
@@ -32,7 +39,11 @@ export function ScannerSelector({
         // Seed defaults if state is empty
         if (Object.keys(state.enabled).length === 0) {
           const defaults: Record<string, boolean> = {};
-          for (const t of filtered) defaults[t.id] = !!t.defaultEnabled && t.status === "available";
+          // Default-on for every scanner whose CLI is actually present in the
+          // image. The ScannerSelector previously honored a per-scanner
+          // `defaultEnabled` flag, but inside the Docker image we want the
+          // full sweep wired up by default — the user can opt out per row.
+          for (const t of filtered) defaults[t.id] = t.status === "available";
           onChange({ enabled: defaults });
         }
         setLoading(false);
@@ -41,6 +52,11 @@ export function ScannerSelector({
     return () => { abort = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [kind]);
+
+  const anyPlaywrightEnabled = useMemo(
+    () => tools.some((t) => PLAYWRIGHT_SCANNERS.has(t.id) && state.enabled[t.id]),
+    [tools, state.enabled],
+  );
 
   if (loading) {
     return (
@@ -76,9 +92,7 @@ export function ScannerSelector({
                     {t.detectedVersion.length > 40 ? t.detectedVersion.slice(0, 40) + "…" : t.detectedVersion}
                   </span>
                 )}
-                <Chip selected={t.status === "available"} className="!h-6 !px-2">
-                  {t.status === "available" ? "ready" : t.status === "missing" ? "not installed" : t.status}
-                </Chip>
+                <ToolStatusBadge status={t.status} />
                 <Chip className="!h-6 !px-2">{t.backend}</Chip>
                 {t.license && (
                   <span className="md-label-s text-[color:var(--md-on-surface-variant)]">{t.license}</span>
@@ -104,6 +118,18 @@ export function ScannerSelector({
           </div>
         );
       })}
+      {/* Inline setup hint: one of the enabled scanners needs Chromium. The
+          SetupChecklist auto-collapses to a compact ✓ when everything's ready,
+          and shows a 1-click Install Chromium button when it isn't. */}
+      {anyPlaywrightEnabled && (
+        <div className="mt-2 grid gap-2">
+          <span className="md-label-s text-[color:var(--md-on-surface-variant)]">
+            One of your selected scanners runs in a real browser.
+          </span>
+          <SetupChecklist />
+        </div>
+      )}
+
       {/* Severity legend */}
       <div className="glass-thin p-3 flex flex-wrap gap-2 mt-1">
         <span className="md-label-s text-[color:var(--md-on-surface-variant)] mr-1">severity legend:</span>

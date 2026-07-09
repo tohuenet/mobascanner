@@ -40,6 +40,8 @@ export async function POST(req: NextRequest, ctx: RouteContext<"/api/scans/[id]/
       scanBus.emitEvent({ kind: "log", scanId: id, level, message, at: Date.now() });
     },
     progress: async () => { /* not streamed */ },
+    // Agentic loop doesn't participate in dynamic discovery — no-op consumer.
+    discover: () => false,
   }, { iterations });
 
   return NextResponse.json(result);

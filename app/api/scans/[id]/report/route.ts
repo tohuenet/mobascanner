@@ -1,23 +1,34 @@
 /**
- * GET /api/scans/[id]/report?format=markdown — bug-bounty / pentest-report
- * shaped markdown of the scan, ready to paste into a HackerOne / Bugcrowd /
- * internal ticket.
+ * GET /api/scans/[id]/report?format=… — pentest-report shaped export of a scan.
  *
  * Format flavors:
- *   - markdown (default)
- *   - exec-summary (one-pager for non-technical audience)
+ *   - markdown (default)   → text/markdown, paste-into-ticket shaped
+ *   - exec-summary         → text/markdown, one-pager for non-technical readers
+ *   - html                 → text/html, self-contained + offline + print-clean
  */
 
 import { NextResponse } from "next/server";
 import { getScan, listFindings } from "@/lib/store";
 import { rankFindings } from "@/lib/triage/ranker";
-import type { Finding } from "@/lib/types";
+import type { Finding, Scan, Severity } from "@/lib/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const SEV_ICON: Record<string, string> = {
   critical: "🔴", high: "🟠", medium: "🟡", low: "🔵", info: "⚪",
+};
+
+const SEVERITY_ORDER: Severity[] = ["critical", "high", "medium", "low", "info"];
+const SEV_RANK: Record<Severity, number> = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+
+/** Standalone colors for the offline HTML doc (no app tokens available there). */
+const SEV_HEX: Record<Severity, string> = {
+  critical: "#b3261e",
+  high: "#c4531d",
+  medium: "#a2761b",
+  low: "#1f6feb",
+  info: "#5b6472",
 };
 
 function fmtMarkdown(scan: { id: string; target: { value: string }; createdAt: number; counts: Record<string, number> }, findings: Finding[]): string {
@@ -94,6 +105,190 @@ ${Object.entries(findings.reduce<Record<string, number>>((acc, f) => { acc[f.sca
 Reproduce: scan id \`${scan.id}\`.`;
 }
 
+/** Escape for safe interpolation into the standalone HTML document. */
+function esc(s: unknown): string {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function authMode(scan: Scan): "none" | "manual" | "profile" {
+  const auth = scan.target.auth;
+  if (!auth) return "none";
+  if (auth.profileId) return "profile";
+  if (auth.headers || auth.cookies || auth.basicAuth || auth.bearerToken) return "manual";
+  return "none";
+}
+
+function isAggressive(scan: Scan): boolean {
+  const opts = scan.selection.options ?? {};
+  return (
+    Object.values(opts).some(
+      (o) => o && typeof o === "object" && (o as Record<string, unknown>).aggressive === true,
+    ) || Boolean((scan.meta as Record<string, unknown> | undefined)?.aggressive)
+  );
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+/** A self-contained HTML report: no external assets, prints cleanly, mirrors
+ *  the on-screen Summary (header, severity table, top-ROI, full findings). */
+function fmtHtml(scan: Scan, findings: Finding[]): string {
+  const ranked = rankFindings(findings);
+  const counts = scan.counts;
+  const total = findings.length;
+  const actNow = (counts.critical ?? 0) + (counts.high ?? 0);
+  const duration =
+    scan.startedAt && scan.finishedAt ? fmtDuration(scan.finishedAt - scan.startedAt) : "—";
+
+  const sevPill = (sev: Severity) =>
+    `<span class="pill" style="color:${SEV_HEX[sev]};border-color:${SEV_HEX[sev]}">${esc(sev)}</span>`;
+
+  const locOf = (f: Finding) =>
+    f.location.file
+      ? `${f.location.file}${f.location.line ? `:${f.location.line}` : ""}`
+      : f.location.url ?? "—";
+
+  const sevRows = SEVERITY_ORDER.map(
+    (s) =>
+      `<tr><td><span class="dot" style="background:${SEV_HEX[s]}"></span>${esc(s)}</td>` +
+      `<td class="num">${counts[s] ?? 0}</td></tr>`,
+  ).join("");
+
+  const topRows = ranked
+    .slice(0, 10)
+    .map((r) => {
+      const f = r.finding;
+      return (
+        `<li><span class="rank">${r.rank}</span>${sevPill(f.severity)} ` +
+        `<strong>${esc(f.title)}</strong> ` +
+        `<span class="loc">${esc(locOf(f))}</span> ` +
+        `<span class="score">score ${Math.round(r.score)}</span></li>`
+      );
+    })
+    .join("");
+
+  const ordered = ranked
+    .slice()
+    .sort(
+      (a, b) =>
+        SEV_RANK[b.finding.severity] - SEV_RANK[a.finding.severity] ||
+        (b.finding.cvss ?? 0) - (a.finding.cvss ?? 0),
+    );
+
+  const findingBlocks = ordered
+    .map(({ finding: f }) => {
+      const tags = [
+        f.ruleId ? `rule ${esc(f.ruleId)}` : "",
+        f.cvss !== undefined ? `CVSS ${esc(f.cvss)}` : "",
+        ...(f.cwe ?? []).map((c) => esc(c)),
+        ...(f.owasp ?? []).map((c) => `OWASP ${esc(c)}`),
+      ]
+        .filter(Boolean)
+        .map((t) => `<span class="tag">${t}</span>`)
+        .join(" ");
+      const refs = (f.references ?? [])
+        .map((r) => `<li><a href="${esc(r)}">${esc(r)}</a></li>`)
+        .join("");
+      return `
+      <article class="finding">
+        <h3>${sevPill(f.severity)} ${esc(f.title)}</h3>
+        <p class="loc">${esc(locOf(f))} · ${esc(f.scannerName)} · confidence ${esc(f.confidence)}</p>
+        ${tags ? `<p class="tags">${tags}</p>` : ""}
+        ${f.description ? `<p>${esc(f.description)}</p>` : ""}
+        ${f.remediation ? `<div class="rem"><strong>Remediation</strong><p>${esc(f.remediation)}</p></div>` : ""}
+        ${refs ? `<div class="refs"><strong>References</strong><ul>${refs}</ul></div>` : ""}
+      </article>`;
+    })
+    .join("");
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security report — ${esc(scan.target.value)}</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #16181d;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  main { max-width: 900px; margin: 0 auto; padding: 40px 28px 64px; }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 34px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #e3e5ea; }
+  h3 { font-size: 15px; margin: 0 0 6px; }
+  .target { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; color: #444; word-break: break-all; margin: 0 0 16px; }
+  dl.meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 20px; margin: 0; }
+  dl.meta dt { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; }
+  dl.meta dd { margin: 2px 0 0; font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; max-width: 360px; }
+  td { padding: 6px 10px; border-bottom: 1px solid #eceef2; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: middle; }
+  .pill { display: inline-block; border: 1px solid; border-radius: 999px; padding: 1px 8px; font-size: 11px;
+    text-transform: uppercase; letter-spacing: .03em; font-weight: 700; }
+  ol.top { list-style: none; padding: 0; margin: 0; }
+  ol.top li { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; padding: 7px 0; border-bottom: 1px solid #f0f1f4; }
+  .rank { color: #9aa0aa; font-weight: 700; min-width: 18px; }
+  .loc { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #5b6472; word-break: break-all; }
+  .score { margin-left: auto; font-size: 12px; color: #6b7280; }
+  article.finding { padding: 14px 0; border-bottom: 1px solid #eceef2; break-inside: avoid; }
+  .tags { margin: 6px 0; }
+  .tag { display: inline-block; background: #f1f2f5; color: #3a3f47; border-radius: 6px; padding: 1px 7px; font-size: 11px; margin-right: 4px; }
+  .rem { background: #f7f8fa; border-left: 3px solid #1f6feb; padding: 8px 12px; margin: 8px 0; border-radius: 0 6px 6px 0; }
+  .rem p, .refs { margin: 4px 0 0; }
+  .refs a { color: #1f6feb; word-break: break-all; }
+  footer { margin-top: 40px; color: #9aa0aa; font-size: 12px; }
+  @media print { main { padding: 0; max-width: none; } a { color: inherit; text-decoration: none; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Security Assessment Report</h1>
+    <p class="target">${esc(scan.target.value)}</p>
+    <dl class="meta">
+      <div><dt>Scan id</dt><dd>${esc(scan.id)}</dd></div>
+      <div><dt>Kind</dt><dd>${esc(scan.kind)}</dd></div>
+      <div><dt>Date</dt><dd>${esc(new Date(scan.createdAt).toLocaleString())}</dd></div>
+      <div><dt>Duration</dt><dd>${esc(duration)}</dd></div>
+      <div><dt>Total findings</dt><dd>${total}</dd></div>
+      <div><dt>Critical + High</dt><dd>${actNow}</dd></div>
+      <div><dt>Auth mode</dt><dd>${esc(authMode(scan))}</dd></div>
+      <div><dt>Aggressive</dt><dd>${isAggressive(scan) ? "on" : "off"}</dd></div>
+    </dl>
+  </header>
+
+  <section>
+    <h2>Severity breakdown</h2>
+    <table><tbody>${sevRows}</tbody></table>
+  </section>
+
+  <section>
+    <h2>Top priorities (by ROI)</h2>
+    ${topRows ? `<ol class="top">${topRows}</ol>` : "<p>No findings.</p>"}
+  </section>
+
+  <section>
+    <h2>All findings (${total})</h2>
+    ${findingBlocks || "<p>No findings recorded for this scan.</p>"}
+  </section>
+
+  <footer>Generated by moba-scanner · authorized testing only. Reproduce with scan id <code>${esc(scan.id)}</code>.</footer>
+</main>
+</body>
+</html>`;
+}
+
 export async function GET(req: Request, ctx: RouteContext<"/api/scans/[id]/report">) {
   const { id } = await ctx.params;
   const url = new URL(req.url);
@@ -101,11 +296,22 @@ export async function GET(req: Request, ctx: RouteContext<"/api/scans/[id]/repor
   const scan = await getScan(id);
   if (!scan) return NextResponse.json({ error: "not found" }, { status: 404 });
   const findings = await listFindings(id);
-  const md = format === "exec-summary" ? fmtExecSummary(scan, findings) : fmtMarkdown(scan, findings);
+
+  if (format === "html") {
+    return new NextResponse(fmtHtml(scan, findings), {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Disposition": `attachment; filename="moba-${id}.html"`,
+      },
+    });
+  }
+
+  const isExec = format === "exec-summary";
+  const md = isExec ? fmtExecSummary(scan, findings) : fmtMarkdown(scan, findings);
   return new NextResponse(md, {
     headers: {
       "Content-Type": "text/markdown; charset=utf-8",
-      "Content-Disposition": `attachment; filename="moba-${id}.md"`,
+      "Content-Disposition": `attachment; filename="moba-${id}${isExec ? "-exec" : ""}.md"`,
     },
   });
 }

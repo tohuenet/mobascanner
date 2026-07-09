@@ -12,6 +12,10 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Harness/tooling scratch: git worktrees and agent artifacts under .claude
+    // are not project source and must never be linted (a duplicate source tree
+    // there otherwise double-counts every finding).
+    ".claude/**",
   ]),
 ]);
 

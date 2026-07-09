@@ -7,6 +7,7 @@
 "use client";
 
 import * as React from "react";
+import type { ScanStatus, ToolStatus } from "@/lib/types";
 
 type ButtonVariant = "filled" | "tonal" | "outlined" | "text" | "elevated";
 
@@ -93,6 +94,96 @@ export function SeverityBadge({ severity, children, className = "" }: { severity
       <span className="sev-dot" style={{ background: color, color }} />
       {children ?? severity}
     </span>
+  );
+}
+
+/**
+ * Shared status-pill visual (color dot + text label) behind the tool- and
+ * scan-status badges. The label is always spelled out so status is never
+ * conveyed by color alone — an accessibility requirement.
+ */
+function StatusPill({
+  color,
+  children,
+  className = "",
+}: {
+  color: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 px-2.5 h-6 rounded-full md-label-s ${className}`}
+      style={{
+        color,
+        background: `color-mix(in oklab, ${color} 16%, transparent)`,
+        border: `1px solid color-mix(in oklab, ${color} 38%, transparent)`,
+      }}
+    >
+      <span className="sev-dot" style={{ background: color, color }} />
+      {children}
+    </span>
+  );
+}
+
+/**
+ * Availability badge for a scanner's underlying CLI/tool. Promoted from the
+ * three near-identical private copies in ScannerInventory, ToolsManager and
+ * ScannerSelector. `availableLabel` lets the Tools page say "installed" while
+ * the dashboard/selector say "ready"; `error`/undefined-status render the
+ * detection's transient states.
+ */
+export function ToolStatusBadge({
+  status,
+  error = false,
+  availableLabel = "ready",
+  className = "",
+}: {
+  status?: ToolStatus;
+  error?: boolean;
+  availableLabel?: string;
+  className?: string;
+}) {
+  const { label, color } = ((): { label: string; color: string } => {
+    if (error) return { label: "status n/a", color: "var(--md-on-surface-variant)" };
+    switch (status) {
+      case "available":
+        return { label: availableLabel, color: "var(--md-severity-low)" };
+      case "missing":
+        return { label: "not installed", color: "var(--md-severity-high)" };
+      case "outdated":
+        return { label: "outdated", color: "var(--md-severity-medium)" };
+      case "unknown":
+        return { label: "unknown", color: "var(--md-on-surface-variant)" };
+      default:
+        return { label: "checking…", color: "var(--md-on-surface-variant)" };
+    }
+  })();
+  return (
+    <StatusPill color={color} className={className}>
+      {label}
+    </StatusPill>
+  );
+}
+
+const SCAN_STATUS_COLOR: Record<ScanStatus, string> = {
+  completed: "var(--md-severity-low)",
+  running: "var(--md-primary)",
+  queued: "var(--md-on-surface-variant)",
+  failed: "var(--md-error)",
+  cancelled: "var(--md-on-surface-variant)",
+};
+
+/**
+ * Lifecycle badge for a scan run. Unifies the ad-hoc `<Chip selected>` status
+ * rendering used across the dashboard, scans list and scan header so every
+ * surface colors queued/running/completed/failed/cancelled the same way.
+ */
+export function ScanStatusBadge({ status, className = "" }: { status: ScanStatus; className?: string }) {
+  return (
+    <StatusPill color={SCAN_STATUS_COLOR[status]} className={className}>
+      {status}
+    </StatusPill>
   );
 }
 

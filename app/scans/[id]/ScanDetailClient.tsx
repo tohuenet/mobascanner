@@ -16,10 +16,12 @@
  * attention.
  */
 
+import Link from "next/link";
 import { Suspense, useEffect, useReducer, useState } from "react";
 import { ScanHeader } from "@/components/ScanHeader";
 import { SeverityCounters } from "@/components/SeverityCounters";
 import { Tabs, type TabItem } from "@/components/scan-tabs/Tabs";
+import { SummaryTab } from "@/components/scan-tabs/SummaryTab";
 import { FindingsTab } from "@/components/scan-tabs/FindingsTab";
 import { ActivityTab } from "@/components/scan-tabs/ActivityTab";
 import { LogsTab } from "@/components/scan-tabs/LogsTab";
@@ -32,6 +34,13 @@ export interface DiscoveredEvent {
   method?: string;
   source: { scannerId: string; via: string; parentUrl?: string };
   at: number;
+}
+
+/** A project this scan belongs to, with its correlated-finding count. */
+export interface ScanProjectPointer {
+  id: string;
+  name: string;
+  correlatedCount: number;
 }
 
 interface State {
@@ -173,9 +182,12 @@ function reducer(state: State, action: Action): State {
 export function ScanDetailClient({
   initialScan,
   initialFindings,
+  projects = [],
 }: {
   initialScan: Scan;
   initialFindings: Finding[];
+  /** Projects this scan is a member of — drives the cross-surface banner. */
+  projects?: ScanProjectPointer[];
 }) {
   const [state, dispatch] = useReducer(reducer, {
     scan: {
@@ -258,6 +270,7 @@ export function ScanDetailClient({
   const failedScanners = progressEntries.filter((p) => p.state === "failed").length;
 
   const tabs: TabItem[] = [
+    { id: "summary", label: "Summary" },
     { id: "findings", label: "Findings", badge: totalFindings || undefined },
     {
       id: "sitemap",
@@ -286,23 +299,16 @@ export function ScanDetailClient({
         running={isRunning}
       />
 
-      {state.scan.errorMessage && (
-        <div
-          role="alert"
-          className="glass p-3 md-body-m"
-          style={{
-            borderColor: "color-mix(in oklab, var(--md-error) 45%, transparent)",
-            color: "var(--md-error)",
-          }}
-        >
-          {state.scan.errorMessage}
-        </div>
-      )}
+      <StatusNotice scan={state.scan} />
+
+      <ProjectBanner projects={projects} />
 
       <Suspense fallback={null}>
-        <Tabs tabs={tabs} defaultId="findings" ariaLabel="Scan sections">
+        <Tabs tabs={tabs} defaultId="summary" ariaLabel="Scan sections">
           {(activeId) => {
             switch (activeId) {
+              case "summary":
+                return <SummaryTab scan={state.scan} findings={state.findings} />;
               case "findings":
                 return <FindingsTab findings={state.findings} />;
               case "sitemap":
@@ -324,4 +330,113 @@ export function ScanDetailClient({
       </Suspense>
     </div>
   );
+}
+
+/**
+ * Cross-surface banner — shown only when this scan is a member of one or more
+ * projects. Points to the correlated project report where DAST×SAST/SCA findings
+ * are joined. Absent entirely otherwise. Each row is a single link so its full
+ * text ("Part of project … · N cross-surface findings · View project") is the
+ * accessible name.
+ */
+function ProjectBanner({ projects }: { projects: ScanProjectPointer[] }) {
+  if (projects.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2 print:hidden" aria-label="Cross-surface projects">
+      {projects.map((p) => (
+        <Link
+          key={p.id}
+          href={`/projects/${p.id}`}
+          className="glass p-4 state-layer hover:translate-y-[-1px] transition-transform flex flex-wrap items-center gap-x-3 gap-y-1"
+          style={{ borderColor: "color-mix(in oklab, var(--md-tertiary) 45%, transparent)" }}
+        >
+          <span
+            className="inline-flex items-center gap-1.5 px-2.5 h-6 rounded-full md-label-s uppercase tracking-wide shrink-0"
+            style={{
+              color: "var(--md-tertiary)",
+              background: "color-mix(in oklab, var(--md-tertiary) 16%, transparent)",
+              border: "1px solid color-mix(in oklab, var(--md-tertiary) 40%, transparent)",
+            }}
+          >
+            cross-surface
+          </span>
+          <span className="md-body-m min-w-0">
+            Part of project <span className="md-title-s break-words">{p.name}</span>
+            <span aria-hidden> · </span>
+            {p.correlatedCount > 0
+              ? `${p.correlatedCount} cross-surface finding${p.correlatedCount === 1 ? "" : "s"}`
+              : "not yet correlated"}
+          </span>
+          <span className="md-label-l text-[color:var(--md-primary)] ml-auto shrink-0">
+            View project →
+          </span>
+        </Link>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Explicit report states for terminal-but-not-clean scans. A `failed` scan
+ * surfaces its error and a way to run again; a `cancelled` scan reassures the
+ * reader that whatever was collected before the stop is retained below.
+ */
+function StatusNotice({ scan }: { scan: Scan }) {
+  if (scan.status === "failed") {
+    return (
+      <div
+        role="alert"
+        className="glass p-4 flex flex-col gap-3"
+        style={{ borderColor: "color-mix(in oklab, var(--md-error) 45%, transparent)" }}
+      >
+        <div className="flex flex-col gap-1">
+          <span className="md-title-s" style={{ color: "var(--md-error)" }}>
+            Scan failed
+          </span>
+          <p className="md-body-m text-[color:var(--md-on-surface-variant)] whitespace-pre-wrap break-words">
+            {scan.errorMessage ?? "The scan stopped before completing. Any findings collected before the failure are shown below."}
+          </p>
+        </div>
+        <Link
+          href={scan.kind === "web" ? "/scan/web" : "/scan/source"}
+          className="state-layer inline-flex items-center gap-2 h-9 px-4 rounded-full w-fit bg-[color:var(--md-primary)] text-[color:var(--md-on-primary)] md-label-l shadow-sm"
+        >
+          Retry — start a new scan
+        </Link>
+      </div>
+    );
+  }
+
+  if (scan.status === "cancelled") {
+    return (
+      <div
+        className="glass p-4 flex flex-col gap-1"
+        style={{ borderColor: "color-mix(in oklab, var(--md-tertiary) 45%, transparent)" }}
+      >
+        <span className="md-title-s" style={{ color: "var(--md-tertiary)" }}>
+          Scan cancelled
+        </span>
+        <p className="md-body-m text-[color:var(--md-on-surface-variant)]">
+          This scan was stopped early. Partial results collected before cancellation are retained and shown below.
+        </p>
+      </div>
+    );
+  }
+
+  if (scan.errorMessage) {
+    return (
+      <div
+        role="alert"
+        className="glass p-3 md-body-m"
+        style={{
+          borderColor: "color-mix(in oklab, var(--md-error) 45%, transparent)",
+          color: "var(--md-error)",
+        }}
+      >
+        {scan.errorMessage}
+      </div>
+    );
+  }
+
+  return null;
 }

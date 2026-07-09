@@ -60,13 +60,12 @@ ENV PIPX_HOME=/opt/pipx \
     PORT=3000 \
     HOSTNAME=0.0.0.0
 
-# ── system packages: apt-shipped scanners + runtimes for the python/ruby tools ──
-# nikto isn't in Debian bookworm's default repos any more — installed from source below.
+# ── runtime apt packages (NO build/dev headers — those are added + purged
+#    inside the compile layer below so they don't bloat the final image) ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl wget git unzip jq openssl bash bsdmainutils gnupg procps \
-      python3 python3-pip python3-dev pipx \
-      libffi-dev libssl-dev \
-      ruby ruby-dev build-essential \
+      python3 python3-pip pipx \
+      ruby \
       perl libnet-ssleay-perl libjson-perl libxml-writer-perl libxml-simple-perl \
       nmap masscan \
  && rm -rf /var/lib/apt/lists/*
@@ -76,20 +75,24 @@ RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto \
  && chmod +x /opt/nikto/program/nikto.pl \
  && ln -s /opt/nikto/program/nikto.pl /usr/local/bin/nikto
 
-# ── python tools via pipx (sidesteps PEP 668 on Debian 12) ──
-RUN set -eux; \
-    pipx install semgrep; \
-    pipx install sqlmap; \
-    pipx install wapiti3; \
-    pipx install bandit; \
-    pipx install checkov; \
-    pipx install detect-secrets; \
-    pipx install kube-hunter; \
-    pipx install prowler; \
-    pipx install scoutsuite
-
-# ── ruby gem ──
-RUN gem install --no-document brakeman
+# ── python + ruby tools (build deps installed AND PURGED in the same layer so
+#    ~700MB of gcc + dev headers never end up in the final image) ──
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3-dev libffi-dev libssl-dev ruby-dev build-essential \
+ && pipx install semgrep \
+ && pipx install sqlmap \
+ && pipx install wapiti3 \
+ && pipx install bandit \
+ && pipx install checkov \
+ && pipx install detect-secrets \
+ && pipx install kube-hunter \
+ && pipx install prowler \
+ && pipx install scoutsuite \
+ && gem install --no-document brakeman \
+ && apt-get purge -y --auto-remove \
+      python3-dev libffi-dev libssl-dev ruby-dev build-essential \
+ && apt-get clean && rm -rf /var/lib/apt/lists/* /root/.cache
 
 # ── npm globals (snyk needs `snyk auth` at runtime; cdxgen for SBOMs) ──
 RUN npm install -g snyk @cyclonedx/cdxgen
@@ -144,6 +147,14 @@ RUN install -m 0755 -d /etc/apt/keyrings \
       > /etc/apt/sources.list.d/trivy.list \
  && apt-get update && apt-get install -y --no-install-recommends trivy \
  && rm -rf /var/lib/apt/lists/*
+
+# ── pre-warm Trivy's CVE DB so the first scan doesn't block on the ~500MB
+#    download. Non-fatal — if the warm fails the first scan just fetches. ──
+RUN trivy image --download-db-only --no-progress 2>&1 | tail -10 || true
+
+# ── pre-warm nuclei-templates (~10k YAML rules) so nuclei has content out of
+#    the box. Without this, nuclei produces zero findings. Non-fatal. ──
+RUN nuclei -update-templates -duc -silent 2>&1 | tail -10 || true
 
 # ── testssl.sh (Bash script — relies on bash + openssl, already present) ──
 RUN git clone --depth 1 --branch 3.2 https://github.com/drwetter/testssl.sh.git /opt/testssl.sh \

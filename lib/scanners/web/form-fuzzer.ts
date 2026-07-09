@@ -11,51 +11,24 @@
  *     (reflection, DB error, time delay, file content disclosure).
  *
  * Uses BrowsingSession so cookies set during navigation come along.
+ *
+ * Dynamic-discovery integration (engine plan P2b):
+ *   - The static `run()` reads forms from the persisted SiteMap as before.
+ *   - `consume({kind: "form"})` fires for any form a later scanner publishes
+ *     into the DiscoveryBus (e.g. SPA crawler finds a form post-render, or a
+ *     content-discovery hit reveals a new form). Same fuzz loop, same emit
+ *     contract.
+ *   - After every submit we feed the post-submit destination URL back into
+ *     the bus via ctx.discover — that's how a register form → /dashboard
+ *     chain ends up being discovered without manual seeding.
  */
 
 import { randomBytes } from "node:crypto";
-import { draft, type Scanner } from "../../engine/scanner";
+import { draft, type Scanner, type ScanContext, type DiscoveredItem } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
 import { loadSiteMap, type SiteMapForm } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
-
-const SQL_ERROR_RE = /you have an error in your sql syntax|warning:\s*mysql_|unclosed quotation mark|quoted string not properly terminated|pg_query|ORA-\d{5}|SQLite\.Exception|System\.Data\.SQLite\.SQLiteException|syntax error at or near/i;
-const LFI_MARKERS = ["root:x:0:0:", "[boot loader]"];
-const CMD_MARKERS = [/uid=\d+\(.+?\)\s+gid=\d+/, /\bDarwin\b.*?Kernel Version/];
-
-interface Probe {
-  rule: string;
-  payload: string;
-  detect: (resp: { body: string; latencyMs: number; contentType: string }, canary: string) => null | { reason: string; severity: "critical" | "high" | "medium" | "low" | "info"; cwe: string[]; owasp: string[]; remediation: string };
-}
-
-function looksLikeHtml(ct: string): boolean { return /\b(text\/html|application\/xhtml)\b/i.test(ct); }
-function looksLikeJson(ct: string): boolean { return /\b(application\/json|application\/.*\+json)\b/i.test(ct); }
-
-const PROBES = (canary: string): Probe[] => [
-  { rule: "xss/reflected-form", payload: `"<svg/onload=alert('${canary}')>`, detect: (r) => {
-      // Must be HTML AND payload reflected unencoded — JSON-echoed canary is not XSS.
-      if (!r.body.includes(canary)) return null;
-      if (looksLikeJson(r.contentType) && !looksLikeHtml(r.contentType)) {
-        return { reason: `parameter is echoed in JSON response (input-reflection, NOT browser-executable XSS)`, severity: "info", cwe: ["CWE-200"], owasp: ["A05:2021"], remediation: "Confirm the response Content-Type is json and not rendered as HTML anywhere downstream." };
-      }
-      if (!looksLikeHtml(r.contentType)) return null;
-      // Encoded → safe.
-      if (r.body.includes(`&lt;svg`) || r.body.includes(`&quot;&lt;svg`)) return null;
-      // Look for the literal tag near our canary.
-      const tagRe = new RegExp(`<svg[^>]*${canary}`, "i");
-      if (!tagRe.test(r.body)) return null;
-      return { reason: `payload reflected as a live HTML tag (canary "${canary}")`, severity: "high", cwe: ["CWE-79"], owasp: ["A03:2021"], remediation: "Encode untrusted input in the appropriate HTML context. Apply CSP." };
-    } },
-  { rule: "sqli/error-form", payload: "'\"`)/*--", detect: (r) => SQL_ERROR_RE.test(r.body)
-      ? { reason: "DB engine error string in response", severity: "critical", cwe: ["CWE-89"], owasp: ["A03:2021"], remediation: "Use parameterized queries / prepared statements." } : null },
-  { rule: "sqli/time-form", payload: "1' AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--", detect: (r) => r.latencyMs >= 4500
-      ? { reason: `response delayed ${Math.round(r.latencyMs)}ms after sleep payload`, severity: "critical", cwe: ["CWE-89"], owasp: ["A03:2021"], remediation: "Use parameterized queries / prepared statements." } : null },
-  { rule: "lfi/traversal-form", payload: "../../../../etc/passwd", detect: (r) => LFI_MARKERS.some((m) => r.body.includes(m))
-      ? { reason: "system file content disclosed in response", severity: "critical", cwe: ["CWE-22"], owasp: ["A01:2021"], remediation: "Reject paths containing `..`, normalize via realpath, allow-list filenames." } : null },
-  { rule: "cmdi/exec-form", payload: ";id; #", detect: (r) => CMD_MARKERS.some((m) => m.test(r.body))
-      ? { reason: "shell command output in response", severity: "critical", cwe: ["CWE-78"], owasp: ["A03:2021"], remediation: "Never pass user input to shells; use language-native argv APIs." } : null },
-];
+import { buildProbes, effectiveRule, type Probe } from "./_probes";
 
 function baselineFor(type: string): string {
   switch (type) {
@@ -88,12 +61,217 @@ function buildBody(form: SiteMapForm, mutateName?: string, mutateValue?: string)
   return { body: data.toString(), ct: "application/x-www-form-urlencoded" };
 }
 
+const SKIP_INPUT_TYPES = new Set(["submit", "button", "reset", "image", "file"]);
+const CSRF_NAME_RE = /(csrf|xsrf|authenticity_token|_token)/i;
+
+function fuzzableInputsOf(form: SiteMapForm): SiteMapForm["inputs"] {
+  return form.inputs.filter(
+    (i) => !SKIP_INPUT_TYPES.has(i.type) && !CSRF_NAME_RE.test(i.name),
+  );
+}
+
+/** Per-scan set of forms we already fuzzed. Prevents consume() from
+ *  re-fuzzing a form that run() already processed (the crawler publishes
+ *  the same form into the bus that it wrote into the SiteMap). Keyed by
+ *  scanId so concurrent scans don't pollute each other's dedupe. */
+const fuzzedForms = new Map<string, Set<string>>();
+
+function formCanonicalKey(form: SiteMapForm): string {
+  const inputs = form.inputs.map((i) => i.name).filter(Boolean).sort().join(",");
+  return `${form.method}|${form.action}|${inputs}`;
+}
+
+function markFuzzed(scanId: string, form: SiteMapForm): void {
+  let s = fuzzedForms.get(scanId);
+  if (!s) {
+    s = new Set();
+    fuzzedForms.set(scanId, s);
+  }
+  s.add(formCanonicalKey(form));
+}
+
+function alreadyFuzzed(scanId: string, form: SiteMapForm): boolean {
+  return fuzzedForms.get(scanId)?.has(formCanonicalKey(form)) ?? false;
+}
+
+/** Per-scan cache of BrowsingSession so cookies set during the run-phase's
+ *  benign-baseline submits survive into consume(). Without this, a register
+ *  form that lands on /dashboard would lose its session when consume() later
+ *  fuzzes a form discovered AFTER the user was "logged in" mid-scan. */
+const sessions = new Map<string, BrowsingSession>();
+
+function getSession(ctx: ScanContext): BrowsingSession {
+  const existing = sessions.get(ctx.scanId);
+  if (existing) return existing;
+  const seed = safeUrl(ctx.target.value);
+  const origin = seed?.origin ?? ctx.target.value;
+  const fresh = new BrowsingSession(origin, {
+    ...(ctx.target.auth?.headers ?? {}),
+    ...(ctx.target.auth?.bearerToken ? { Authorization: `Bearer ${ctx.target.auth.bearerToken}` } : {}),
+  });
+  sessions.set(ctx.scanId, fresh);
+  return fresh;
+}
+
+/** Emit the post-submit destination (final URL + each redirect hop) into the
+ *  discovery bus. Cleaned-up so we don't chase off-host SSO/parking pages. */
+function emitDestinations(
+  form: SiteMapForm,
+  r: { redirectChain: string[]; finalUrl: string },
+  ctx: ScanContext,
+  via: string,
+) {
+  let formHost = "";
+  try { formHost = new URL(form.action).host; } catch { /* ignore */ }
+  for (const hop of r.redirectChain) {
+    try {
+      if (formHost && new URL(hop).host !== formHost) continue;
+      ctx.discover({
+        kind: "url",
+        url: hop,
+        source: { scannerId: "web.form-fuzzer", via, parentUrl: form.action },
+      });
+    } catch { /* skip */ }
+  }
+  if (r.finalUrl && r.finalUrl !== form.action) {
+    try {
+      if (!formHost || new URL(r.finalUrl).host === formHost) {
+        ctx.discover({
+          kind: "url",
+          url: r.finalUrl,
+          source: { scannerId: "web.form-fuzzer", via: `${via}-landing`, parentUrl: form.action },
+        });
+      }
+    } catch { /* skip */ }
+  }
+}
+
+/** ONE benign submission with all inputs at their baseline values. The point
+ *  isn't detection — it's discovery: the landing page after a valid submit
+ *  is exactly the "/dashboard" / "/admin" / etc. surface the user actually
+ *  cares about. Doing this BEFORE the attack payloads also means the
+ *  destination URL flows into the bus without attack-payload error noise. */
+async function benignSubmit(
+  form: SiteMapForm,
+  session: BrowsingSession,
+  ctx: ScanContext,
+): Promise<void> {
+  const built = buildBody(form);
+  if (!built) return;
+  try {
+    if ("url" in built && built.url) {
+      const r = await session.fetch(built.url.toString(), { method: "GET", signal: ctx.signal });
+      emitDestinations(form, r, ctx, "benign-baseline");
+    } else if ("body" in built) {
+      const r = await session.fetch(form.action, {
+        method: "POST",
+        body: built.body,
+        headers: { "content-type": built.ct },
+        signal: ctx.signal,
+      });
+      emitDestinations(form, r, ctx, "benign-baseline");
+    }
+  } catch {
+    /* benign pass is best-effort */
+  }
+}
+
+/** Run all PROBES against every fuzzable input of one form. Emits findings
+ *  via ctx.emit and feeds post-submit destination URLs back through
+ *  ctx.discover so downstream consumers (other scanners) can re-process them.
+ *  Returns the number of submissions attempted. */
+async function fuzzForm(
+  form: SiteMapForm,
+  session: BrowsingSession,
+  ctx: ScanContext,
+  canary: string,
+  probes: Probe[],
+  onSubmission?: () => void,
+): Promise<number> {
+  const inputs = fuzzableInputsOf(form);
+  if (!inputs.length) return 0;
+
+  // Benign baseline FIRST — discovery without the attack-payload echo noise.
+  await benignSubmit(form, session, ctx);
+
+  let count = 0;
+
+  for (const input of inputs) {
+    for (const p of probes) {
+      if (ctx.signal.aborted) return count;
+      const built = buildBody(form, input.name, p.payload);
+      if (!built) continue;
+      const t0 = Date.now();
+      let body = "";
+      let status = 0;
+      let contentType = "";
+      let redirectChain: string[] = [];
+      let finalUrl = "";
+      try {
+        if ("url" in built && built.url) {
+          const r = await session.fetch(built.url.toString(), { method: "GET", signal: ctx.signal });
+          body = r.body;
+          status = r.res.status;
+          contentType = r.res.headers.get("content-type") ?? "";
+          redirectChain = r.redirectChain;
+          finalUrl = r.finalUrl;
+        } else if ("body" in built) {
+          const r = await session.fetch(form.action, {
+            method: "POST",
+            body: built.body,
+            headers: { "content-type": built.ct },
+            signal: ctx.signal,
+          });
+          body = r.body;
+          status = r.res.status;
+          contentType = r.res.headers.get("content-type") ?? "";
+          redirectChain = r.redirectChain;
+          finalUrl = r.finalUrl;
+        }
+      } catch {
+        continue;
+      }
+      count += 1;
+      onSubmission?.();
+
+      emitDestinations(form, { redirectChain, finalUrl }, ctx, "form-redirect");
+
+      const hit = p.detect({ body, latencyMs: Date.now() - t0, contentType }, canary);
+      if (!hit) continue;
+      const rule = effectiveRule(p.rule, hit);
+      const labelPrefix = rule === "reflection/json-echo" ? "PARAM REFLECTION" : rule.toUpperCase();
+      await ctx.emit(draft({
+        severity: hit.severity,
+        confidence: p.rule.startsWith("sqli/time") ? "medium" : "high",
+        title: `${labelPrefix} on form input "${input.name}" (${form.method} ${form.action})`,
+        description: `Probe payload: ${truncate(p.payload, 80)}\n\n→ ${hit.reason}`,
+        ruleId: rule,
+        cwe: hit.cwe,
+        owasp: hit.owasp,
+        location: { url: form.action, snippet: input.name },
+        evidence: { method: form.method, input: input.name, payload: p.payload, status, snippet: truncate(body, 400) },
+        remediation: hit.remediation,
+      }));
+    }
+  }
+  return count;
+}
+
+/** Heuristic: should this form be fuzzed? Login forms go to brute-login;
+ *  empty forms are no-ops. Aggressive scans bypass the login filter. */
+function shouldFuzz(form: SiteMapForm, opts: { aggressive: boolean }): boolean {
+  if (!form.inputs.length) return false;
+  if (!opts.aggressive && form.looksLikeLogin) return false;
+  return true;
+}
+
 export const formFuzzerScanner: Scanner = {
   id: "web.form-fuzzer",
   name: "Form Fuzzer",
   kind: "web",
-  description: "Submits every form discovered by the crawler with XSS/SQLi/LFI/cmd-injection probes per non-CSRF input. Skips login forms.",
+  description: "Submits every form discovered by the crawler with XSS/SQLi/LFI/cmd-injection probes per non-CSRF input. Skips login forms unless scan.meta.aggressive=true.",
   defaultEnabled: false, // active probes — opt-in
+  consumes: ["form"],
 
   async tool() {
     return {
@@ -107,72 +285,51 @@ export const formFuzzerScanner: Scanner = {
     if (!seed) return;
     const map = await loadSiteMap(ctx.scanId);
     if (!map || !map.forms.length) {
-      await ctx.log("info", "no SiteMap forms — run web.crawler first");
+      await ctx.log("info", "no SiteMap forms — run web.crawler first; will still consume forms discovered dynamically");
       await ctx.progress(1, "skipped");
       return;
     }
-    const session = new BrowsingSession(seed.origin, {
-      ...(ctx.target.auth?.headers ?? {}),
-      ...(ctx.target.auth?.bearerToken ? { Authorization: `Bearer ${ctx.target.auth.bearerToken}` } : {}),
-    });
+    const session = getSession(ctx);
+    const aggressive = Boolean(ctx.options.aggressive);
 
-    // Skip login forms (brute-login covers those) and forms with no inputs.
-    const forms = map.forms.filter((f) => !f.looksLikeLogin && f.inputs.length > 0);
+    const forms = map.forms.filter((f) => shouldFuzz(f, { aggressive }));
     if (!forms.length) { await ctx.progress(1, "no fuzzable forms"); return; }
 
     const canary = "MOBA" + randomBytes(4).toString("hex");
-    const probes = PROBES(canary);
-    const totalSubmissions = forms.reduce((a, f) => a + f.inputs.filter((i) => !["submit", "button", "reset", "image", "file"].includes(i.type) && !/(csrf|xsrf|authenticity_token|_token)/i.test(i.name)).length * probes.length, 0);
+    const probes = buildProbes(canary);
+    const totalSubmissions = forms.reduce(
+      (a, f) => a + fuzzableInputsOf(f).length * probes.length,
+      0,
+    );
     let done = 0;
 
     for (const form of forms) {
       if (ctx.signal.aborted) break;
-      const fuzzableInputs = form.inputs.filter((i) =>
-        !["submit", "button", "reset", "image", "file"].includes(i.type) &&
-        !/(csrf|xsrf|authenticity_token|_token)/i.test(i.name));
-      for (const input of fuzzableInputs) {
-        for (const p of probes) {
-          if (ctx.signal.aborted) break;
-          const built = buildBody(form, input.name, p.payload);
-          if (!built) continue;
-          const t0 = Date.now();
-          let body = "";
-          let status = 0;
-          let contentType = "";
-          try {
-            if ("url" in built && built.url) {
-              const r = await session.fetch(built.url.toString(), { method: "GET", signal: ctx.signal });
-              body = r.body; status = r.res.status;
-              contentType = r.res.headers.get("content-type") ?? "";
-            } else if ("body" in built) {
-              const r = await session.fetch(form.action, { method: "POST", body: built.body, headers: { "content-type": built.ct }, signal: ctx.signal });
-              body = r.body; status = r.res.status;
-              contentType = r.res.headers.get("content-type") ?? "";
-            }
-          } catch { continue; }
-          done += 1;
-          if (done % 5 === 0) await ctx.progress(done / Math.max(totalSubmissions, 1), `${done}/${totalSubmissions}`);
-          const hit = p.detect({ body, latencyMs: Date.now() - t0, contentType }, canary);
-          if (!hit) continue;
-          // Use the detector's effective rule when it differs (e.g. info-level
-          // "reflection/json-echo" instead of high-severity "xss/reflected-form").
-          const effectiveRule = hit.severity === "info" && /reflection|echo/i.test(hit.reason) ? "reflection/json-echo" : p.rule;
-          const labelPrefix = effectiveRule === "reflection/json-echo" ? "PARAM REFLECTION" : effectiveRule.toUpperCase();
-          await ctx.emit(draft({
-            severity: hit.severity,
-            confidence: p.rule.startsWith("sqli/time") ? "medium" : "high",
-            title: `${labelPrefix} on form input "${input.name}" (${form.method} ${form.action})`,
-            description: `Probe payload: ${truncate(p.payload, 80)}\n\n→ ${hit.reason}`,
-            ruleId: effectiveRule,
-            cwe: hit.cwe,
-            owasp: hit.owasp,
-            location: { url: form.action, snippet: input.name },
-            evidence: { method: form.method, input: input.name, payload: p.payload, status, snippet: truncate(body, 400) },
-            remediation: hit.remediation,
-          }));
+      markFuzzed(ctx.scanId, form);
+      await fuzzForm(form, session, ctx, canary, probes, () => {
+        done += 1;
+        if (done % 5 === 0) {
+          void ctx.progress(done / Math.max(totalSubmissions, 1), `${done}/${totalSubmissions}`);
         }
-      }
+      });
     }
     await ctx.progress(1, `${done} submissions across ${forms.length} forms`);
+  },
+
+  async consume(item: DiscoveredItem, ctx: ScanContext) {
+    if (item.kind !== "form") return;
+    const aggressive = Boolean(ctx.options.aggressive);
+    if (!shouldFuzz(item.form, { aggressive })) return;
+    if (alreadyFuzzed(ctx.scanId, item.form)) return; // run() got there first
+    markFuzzed(ctx.scanId, item.form);
+    // Each consume call is its own micro-session — keeps state simple and
+    // means consume work doesn't fight the run-phase session for cookies.
+    const session = getSession(ctx);
+    const canary = "MOBA" + randomBytes(4).toString("hex");
+    const probes = buildProbes(canary);
+    const submissions = await fuzzForm(item.form, session, ctx, canary, probes);
+    if (submissions > 0) {
+      await ctx.log("info", `consumed late form ${item.form.method} ${item.form.action} — ${submissions} submissions`);
+    }
   },
 };

@@ -1,11 +1,16 @@
 import Link from "next/link";
-import { Card, Chip, SeverityBadge } from "@/components/ui/Primitives";
+import { Card, Chip, SeverityBadge, ScanStatusBadge } from "@/components/ui/Primitives";
+import { relativeTime } from "@/components/ui/format";
 import { listScans } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
 export default async function ScansListPage() {
   const items = await listScans();
+  // force-dynamic Server Component: reading the clock once per request is stable
+  // for this render (the purity rule targets client re-renders, not server ones).
+  // eslint-disable-next-line react-hooks/purity
+  const now = Date.now();
   return (
     <div className="grid gap-5">
       <header className="flex items-baseline justify-between gap-3">
@@ -47,10 +52,13 @@ export default async function ScansListPage() {
                 >
                   <div className="flex flex-wrap items-center gap-3">
                     <Chip className="!h-6 !px-2">{s.kind}</Chip>
-                    <Chip selected={s.status === "completed"} className="!h-6 !px-2">{s.status}</Chip>
+                    <ScanStatusBadge status={s.status} className="!h-6" />
                     <span className="md-title-s break-all flex-1 min-w-[200px]">{s.target}</span>
-                    <span className="md-body-s text-[color:var(--md-on-surface-variant)]">
-                      {new Date(s.createdAt).toLocaleString()}
+                    <span
+                      className="md-body-s text-[color:var(--md-on-surface-variant)]"
+                      title={new Date(s.createdAt).toLocaleString()}
+                    >
+                      {relativeTime(s.createdAt, now)}
                     </span>
                   </div>
                   <div className="flex flex-wrap items-center gap-2 mt-2">

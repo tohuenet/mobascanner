@@ -6,6 +6,7 @@
    ============================================================================ */
 
 :root {
+  color-scheme: light;
   /* M3 Primary (violet/indigo-leaning, mapped to "moba" identity) */
   --md-primary:               oklch(0.55 0.16 290);
   --md-on-primary:            oklch(1 0 0);
@@ -86,6 +87,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --md-primary:               oklch(0.78 0.12 290);
     --md-on-primary:            oklch(0.18 0.10 290);
     --md-primary-container:     oklch(0.32 0.12 290);
@@ -140,6 +142,131 @@
     --lg-shadow:                0 0 0;
     --lg-shadow-alpha:          0.45;
   }
+}
+
+/* ============================================================================
+   Manual theme override (T3.1)
+   A pre-hydration inline script in app/layout.tsx stamps data-theme on <html>
+   from localStorage. These attribute selectors let the user force light/dark
+   regardless of the OS preference; with no attribute (or data-theme="system")
+   the blocks above keep following @media (prefers-color-scheme). CSS can't OR a
+   media query with an attribute selector, so the dark/light values are declared
+   once more here — keep them in sync with the :root / @media blocks above.
+   :root[data-theme=...] (specificity 0,1,1) always beats the bare :root inside
+   the media query (0,0,1), so a manual choice wins over the system preference.
+   ============================================================================ */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --md-primary:               oklch(0.78 0.12 290);
+  --md-on-primary:            oklch(0.18 0.10 290);
+  --md-primary-container:     oklch(0.32 0.12 290);
+  --md-on-primary-container:  oklch(0.92 0.05 290);
+
+  --md-secondary:             oklch(0.80 0.05 280);
+  --md-on-secondary:          oklch(0.18 0.04 280);
+  --md-secondary-container:   oklch(0.32 0.05 280);
+  --md-on-secondary-container:oklch(0.92 0.03 280);
+
+  --md-tertiary:              oklch(0.82 0.08 20);
+  --md-on-tertiary:           oklch(0.18 0.05 20);
+  --md-tertiary-container:    oklch(0.35 0.08 20);
+  --md-on-tertiary-container: oklch(0.92 0.04 20);
+
+  --md-error:                 oklch(0.78 0.18 27);
+  --md-on-error:              oklch(0.18 0.13 27);
+  --md-error-container:       oklch(0.35 0.16 27);
+  --md-on-error-container:    oklch(0.92 0.08 27);
+
+  --md-severity-critical:     oklch(0.70 0.22 12);
+  --md-severity-high:         oklch(0.78 0.18 35);
+  --md-severity-medium:       oklch(0.82 0.15 80);
+  --md-severity-low:          oklch(0.78 0.13 200);
+  --md-severity-info:         oklch(0.78 0.04 260);
+
+  --md-background:            oklch(0.14 0.02 290);
+  --md-on-background:         oklch(0.92 0.01 290);
+  --md-surface:               oklch(0.14 0.02 290);
+  --md-on-surface:            oklch(0.92 0.01 290);
+  --md-surface-dim:           oklch(0.12 0.02 290);
+  --md-surface-bright:        oklch(0.22 0.02 290);
+  --md-surface-container-lowest: oklch(0.10 0.02 290);
+  --md-surface-container-low:    oklch(0.16 0.02 290);
+  --md-surface-container:        oklch(0.18 0.02 290);
+  --md-surface-container-high:   oklch(0.21 0.02 290);
+  --md-surface-container-highest:oklch(0.24 0.02 290);
+  --md-surface-variant:       oklch(0.30 0.02 290);
+  --md-on-surface-variant:    oklch(0.78 0.02 290);
+  --md-outline:               oklch(0.55 0.02 290);
+  --md-outline-variant:       oklch(0.30 0.02 290);
+
+  --md-inverse-surface:       oklch(0.92 0.01 290);
+  --md-inverse-on-surface:    oklch(0.18 0.02 290);
+  --md-inverse-primary:       oklch(0.50 0.16 290);
+  --md-scrim:                 oklch(0 0 0);
+
+  --lg-tint:                  20 18 30;
+  --lg-tint-alpha:            0.55;
+  --lg-edge:                  255 255 255;
+  --lg-edge-alpha:            0.18;
+  --lg-shadow:                0 0 0;
+  --lg-shadow-alpha:          0.45;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --md-primary:               oklch(0.55 0.16 290);
+  --md-on-primary:            oklch(1 0 0);
+  --md-primary-container:     oklch(0.92 0.05 290);
+  --md-on-primary-container:  oklch(0.18 0.10 290);
+
+  --md-secondary:             oklch(0.55 0.06 280);
+  --md-on-secondary:          oklch(1 0 0);
+  --md-secondary-container:   oklch(0.92 0.03 280);
+  --md-on-secondary-container:oklch(0.18 0.04 280);
+
+  --md-tertiary:              oklch(0.60 0.10 20);
+  --md-on-tertiary:           oklch(1 0 0);
+  --md-tertiary-container:    oklch(0.92 0.04 20);
+  --md-on-tertiary-container: oklch(0.18 0.05 20);
+
+  --md-error:                 oklch(0.55 0.20 27);
+  --md-on-error:              oklch(1 0 0);
+  --md-error-container:       oklch(0.92 0.08 27);
+  --md-on-error-container:    oklch(0.18 0.13 27);
+
+  --md-severity-critical:     oklch(0.55 0.22 12);
+  --md-severity-high:         oklch(0.62 0.20 35);
+  --md-severity-medium:       oklch(0.72 0.16 80);
+  --md-severity-low:          oklch(0.65 0.13 200);
+  --md-severity-info:         oklch(0.68 0.05 260);
+
+  --md-background:            oklch(0.985 0.005 290);
+  --md-on-background:         oklch(0.18 0.02 290);
+  --md-surface:               oklch(0.985 0.005 290);
+  --md-on-surface:            oklch(0.18 0.02 290);
+  --md-surface-dim:           oklch(0.92 0.01 290);
+  --md-surface-bright:        oklch(0.99 0.005 290);
+  --md-surface-container-lowest: oklch(1 0 0);
+  --md-surface-container-low:    oklch(0.97 0.008 290);
+  --md-surface-container:        oklch(0.95 0.01 290);
+  --md-surface-container-high:   oklch(0.93 0.012 290);
+  --md-surface-container-highest:oklch(0.91 0.014 290);
+  --md-surface-variant:       oklch(0.90 0.02 290);
+  --md-on-surface-variant:    oklch(0.40 0.03 290);
+  --md-outline:               oklch(0.65 0.02 290);
+  --md-outline-variant:       oklch(0.85 0.02 290);
+
+  --md-inverse-surface:       oklch(0.25 0.02 290);
+  --md-inverse-on-surface:    oklch(0.95 0.005 290);
+  --md-inverse-primary:       oklch(0.78 0.10 290);
+  --md-scrim:                 oklch(0 0 0);
+
+  --lg-tint:                  255 255 255;
+  --lg-tint-alpha:            0.55;
+  --lg-edge:                  255 255 255;
+  --lg-edge-alpha:            0.7;
+  --lg-shadow:                15 23 42;
+  --lg-shadow-alpha:          0.08;
 }
 
 /* ============================================================================
@@ -354,3 +481,80 @@ body {
 
 /* Code blocks */
 .mono { font-family: var(--font-mono), ui-monospace, monospace; }
+
+/* Brand gradient — the primary→tertiary sweep shared by the app-shell logo mark
+   and the dashboard hero headline. Extracted (T3.4) so the two stay in lockstep
+   instead of repeating the same inline gradient in four places. */
+.brand-gradient {
+  background-image: linear-gradient(135deg, var(--md-primary), var(--md-tertiary));
+}
+.brand-gradient-text {
+  background-image: linear-gradient(120deg, var(--md-primary), var(--md-tertiary));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Toast (T3.3) — a subtle rise-in, suppressed under reduced-motion. */
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.toast-item { animation: toast-in 180ms ease; }
+@media (prefers-reduced-motion: reduce) {
+  .toast-item { animation: none; }
+}
+
+/* ============================================================================
+   Print — turn the on-screen scan report into a clean, PDF-ready document.
+   "Print to PDF" is the common real-world share path, so hide app chrome, drop
+   the glass blur, force readable light-on-white, and expand collapsed findings
+   (FindingsList renders bodies with `hidden print:grid`). Severity stays legible
+   because we keep its color as text and force exact color rendering.
+   ============================================================================ */
+@media print {
+  * {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  html, body {
+    background: #fff !important;
+    color: #111 !important;
+  }
+
+  /* App chrome: sidebar, top bar, footer, and the scan-detail tab bar. */
+  aside,
+  main > header,
+  main > footer,
+  [role="tablist"] {
+    display: none !important;
+  }
+
+  /* Let the report use the full page width. */
+  main > div {
+    padding: 0 !important;
+    max-width: none !important;
+    margin: 0 !important;
+  }
+
+  /* Neutralize Liquid Glass so surfaces print as plain, readable cards. */
+  .glass, .glass-strong, .glass-thin {
+    background: #fff !important;
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    box-shadow: none !important;
+    border: 1px solid #d0d3d9 !important;
+  }
+
+  /* Keep findings and cards from splitting awkwardly across pages. */
+  article, details, .glass, .glass-thin, section {
+    break-inside: avoid;
+  }
+
+  a { color: #1f6feb !important; text-decoration: none !important; }
+
+  /* Suppress hover/press overlays and expensive filters when printing. */
+  .state-layer::after { opacity: 0 !important; }
+}
