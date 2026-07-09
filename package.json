@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./test/_register.mjs test/correlation.test.ts test/fingerprint.test.ts test/interaction-safety.test.ts test/ranker.test.ts test/fingerprint-live.integration.test.ts test/spa-interaction.integration.test.ts"
   },
   "dependencies": {
     "@types/cross-spawn": "^6.0.6",
