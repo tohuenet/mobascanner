@@ -123,22 +123,30 @@ export const graphqlFuzzerScanner: Scanner = {
     for (const field of idFields.slice(0, 8)) {
       if (ctx.signal.aborted) break;
       const probe = (id: number) => ({ query: `{ ${field.name}(id: ${id}) { __typename } }` });
-      let r1, r2;
+      let r1, r2, rControl;
       try {
         r1 = await session.fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(probe(1)), signal: ctx.signal });
         r2 = await session.fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(probe(2)), signal: ctx.signal });
+        // Garbage-id control: an id that should NOT resolve to any object.
+        rControl = await session.fetch(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(probe(999_999_999)), signal: ctx.signal });
       } catch { continue; }
-      const ok1 = !/error|Error|denied|forbidden/i.test(r1.body) && r1.res.status < 400;
-      const ok2 = !/error|Error|denied|forbidden/i.test(r2.body) && r2.res.status < 400;
-      const distinct = r1.body !== r2.body && Math.abs(r1.body.length - r2.body.length) > 5;
-      if (ok1 && ok2 && distinct) {
+      // A real, ACCESSIBLE object echoes a non-null `__typename` with no GraphQL
+      // errors. A missing/denied object returns null or an `errors` array. (Byte
+      // length is useless here — two real objects both return an identical
+      // `{__typename}` shape.)
+      const accessible = (b: string, status: number) =>
+        status < 400 && /"__typename"\s*:\s*"/.test(b) && !/"errors"\s*:/.test(b);
+      // BOLA: ids 1 AND 2 both resolve to accessible objects, but a bogus id does
+      // NOT — the field reads objects by id with no ownership check. If the
+      // control ALSO resolved, the field just echoes any id (not owner-scoped).
+      if (accessible(r1.body, r1.res.status) && accessible(r2.body, r2.res.status) && !accessible(rControl.body, rControl.res.status)) {
         await ctx.emit(draft({
           severity: "high", confidence: "medium",
           title: `Possible GraphQL BOLA on field "${field.name}"`,
-          description: `\`{ ${field.name}(id: 1) }\` and \`{ ${field.name}(id: 2) }\` both succeed and return distinct objects without auth challenge. If \`${field.name}\` returns user/private data, it's BOLA / IDOR.`,
+          description: `\`{ ${field.name}(id: 1) }\` and \`{ ${field.name}(id: 2) }\` both resolve to objects while a bogus id (999999999) does not — the field reads objects by id with no auth challenge. If \`${field.name}\` returns user/private data, it's BOLA / IDOR.`,
           ruleId: "graphql/bola-by-id", cwe: ["CWE-639"], owasp: ["A01:2021"],
           location: { url: endpoint, snippet: field.name },
-          evidence: { field: field.name, len1: r1.body.length, len2: r2.body.length },
+          evidence: { field: field.name, len1: r1.body.length, len2: r2.body.length, controlResolved: false },
           remediation: "Enforce per-object authorization in resolvers. Don't return objects without a user-permissions check.",
           references: ["https://owasp.org/API-Security/editions/2023/en/0xa1-broken-object-level-authorization/"],
         }));

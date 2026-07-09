@@ -18,15 +18,10 @@
  */
 
 import { draft, type Scanner } from "../../engine/scanner";
-import { safeUrl, truncate } from "../common";
+import { safeUrl } from "../common";
 import { loadSiteMap } from "../../web/sitemap";
 import { randomBytes } from "node:crypto";
-
-let chromiumPromise: Promise<typeof import("playwright-core").chromium> | null = null;
-async function getChromium() {
-  if (!chromiumPromise) chromiumPromise = import("playwright-core").then((m) => m.chromium);
-  return chromiumPromise;
-}
+import { acquireBrowser, acquireContext, releaseBrowser, liveBrowserEndpoint, REALISTIC_UA, type AcquiredBrowser } from "../../web/browser";
 
 const HOOKS_SCRIPT = (canary: string) => `
 (() => {
@@ -93,16 +88,21 @@ export const domXssScanner: Scanner = {
       }
     }
 
-    let chromium;
-    try { chromium = await getChromium(); }
-    catch (e) { await ctx.log("warn", `playwright-core not available: ${e instanceof Error ? e.message : e}`); return; }
+    const cdpUrl = liveBrowserEndpoint(undefined);
+    let acq: AcquiredBrowser;
+    try {
+      acq = await acquireBrowser({ cdpUrl, headless: true });
+      if (acq.attached) await ctx.log("info", `attached to live browser at ${acq.endpoint} — DOM-XSS probes run in your real session`);
+    } catch (e) {
+      await ctx.log("warn", cdpUrl
+        ? `could not attach to browser at ${cdpUrl}: ${e instanceof Error ? e.message : e}. Launch Chrome with --remote-debugging-port (docs/live-browser.md).`
+        : `chromium not available (run \`npx playwright install chromium\`): ${e instanceof Error ? e.message : e}`);
+      return;
+    }
 
-    let browser;
-    try { browser = await chromium.launch({ headless: true }); }
-    catch (e) { await ctx.log("warn", `chromium not installed (run \`npx playwright install chromium\`): ${e instanceof Error ? e.message : e}`); return; }
-
-    const context = await browser.newContext({
-      ...(ctx.target.auth?.headers ? { extraHTTPHeaders: ctx.target.auth.headers } : {}),
+    const { context, ownsContext } = await acquireContext(acq, {
+      userAgent: REALISTIC_UA,
+      extraHeaders: ctx.target.auth?.headers,
     });
 
     let probed = 0;
@@ -141,7 +141,7 @@ export const domXssScanner: Scanner = {
           await page.close();
         }
       }
-    } finally { await browser.close(); }
+    } finally { await releaseBrowser(acq, ownsContext, context); }
     await ctx.progress(1, `${probed} DOM-XSS probes`);
   },
 };

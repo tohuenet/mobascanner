@@ -25,6 +25,7 @@
 
 import { draft, type Scanner } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
+import { isProbeableUrl } from "../../web/url-hygiene";
 import { BrowsingSession } from "../../web/session";
 import { saveSiteMap, type SiteMap, type SiteMapPage, type SiteMapForm, type SiteMapApiHint } from "../../web/sitemap";
 
@@ -113,6 +114,9 @@ export const crawlerScanner: Scanner = {
     const forms: SiteMapForm[] = [];
     const apiHints: SiteMapApiHint[] = [];
     const technologies = new Set<string>();
+    // Pages already flagged for reverse-tabnabbing, so one page emits at most
+    // one info note instead of one per external link.
+    const tabnabbingPages = new Set<string>();
 
     // Seed from /robots.txt and /sitemap.xml.
     const seedExtras = ["/robots.txt", "/sitemap.xml", "/.well-known/security.txt", "/.well-known/openid-configuration", "/.well-known/jwks.json"];
@@ -150,11 +154,17 @@ export const crawlerScanner: Scanner = {
         // Robots.txt + sitemap.xml seeding & sensitive-disallow detection.
         if (url.endsWith("/robots.txt") && r.body) {
           for (const m of r.body.matchAll(/^\s*Disallow:\s*([^\s#]+)/gim)) {
+            // robots patterns carry globs (`/*/foo`, `/x$`, `/api?`). Those are
+            // MATCH RULES, not URLs — crawling them yields synthetic 404/redirect
+            // pages whose unstable bodies feed false positives into param-miner
+            // and sqli. Enqueue only the ones that are concrete, fetchable URLs.
             const next = new URL(m[1], start).toString();
-            if (next.startsWith(start.origin) && !seen.has(next)) {
+            if (isProbeableUrl(next) && next.startsWith(start.origin) && !seen.has(next)) {
               seen.add(next); queue.push({ url: next, depth: depth + 1 });
               ctx.discover({ kind: "url", url: next, source: { scannerId: "web.crawler", via: "robots-disallow", parentUrl: url } });
             }
+            // The sensitive-path advisory is about robots ADVERTISING the path;
+            // it stands whether or not the pattern is directly crawlable.
             if (/admin|backup|secret|\.git|\.env|private|internal|debug|test/i.test(m[1])) {
               await ctx.emit(draft({
                 severity: "low", confidence: "medium",
@@ -169,7 +179,7 @@ export const crawlerScanner: Scanner = {
         if (url.endsWith("/sitemap.xml") && r.body) {
           for (const m of r.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/gi)) {
             const next = m[1].trim();
-            if (next.startsWith(start.origin) && !seen.has(next)) {
+            if (isProbeableUrl(next) && next.startsWith(start.origin) && !seen.has(next)) {
               seen.add(next); queue.push({ url: next, depth: depth + 1 });
               ctx.discover({ kind: "url", url: next, source: { scannerId: "web.crawler", via: "sitemap-loc", parentUrl: url } });
             }
@@ -201,6 +211,7 @@ export const crawlerScanner: Scanner = {
               try { next = new URL(ref, r.finalUrl); } catch { continue; }
               if (next.origin !== start.origin) continue;
               if (seen.has(next.toString())) continue;
+              if (!isProbeableUrl(next.toString())) continue;
               if (/\.(png|jpe?g|gif|svg|ico|woff2?|ttf|eot|mp4|webm|webp|pdf)$/i.test(next.pathname)) continue;
               seen.add(next.toString());
               queue.push({ url: next.toString(), depth: depth + 1 });
@@ -214,14 +225,22 @@ export const crawlerScanner: Scanner = {
             for (const m of r.body.matchAll(TAG_ATTR)) {
               const tag = m[1].toLowerCase();
               const a = parseAttrs(m[2]);
-              if (tag === "a" && a.target === "_blank" && !/noopener/i.test(a.rel ?? "")) {
-                await ctx.emit(draft({
-                  severity: "low", confidence: "high",
-                  title: "Reverse tabnabbing: target=_blank without rel=noopener",
-                  description: "Allows the linked page to manipulate the opener via window.opener.",
-                  ruleId: "crawler/tabnabbing", cwe: ["CWE-1022"],
-                  location: { url: r.finalUrl, snippet: truncate(`<a href="${a.href}" target="_blank">`, 200) },
-                }));
+              if (tag === "a" && a.target === "_blank" && !/noopener/i.test(a.rel ?? "") && !tabnabbingPages.has(r.finalUrl)) {
+                // Only meaningful for CROSS-ORIGIN links, and only on legacy
+                // browsers: Chrome 88+/Firefox 79+/Safari 12.1+ imply noopener
+                // for target=_blank. Emit at most once per page, info-level.
+                let external = false;
+                try { external = new URL(a.href ?? "", r.finalUrl).origin !== start.origin; } catch { external = false; }
+                if (external) {
+                  tabnabbingPages.add(r.finalUrl);
+                  await ctx.emit(draft({
+                    severity: "info", confidence: "high",
+                    title: "Reverse tabnabbing: external target=_blank without rel=noopener",
+                    description: "A cross-origin link opens in a new tab without `rel=noopener`. On legacy browsers the linked page could reach `window.opener`; modern browsers (Chrome 88+, Firefox 79+, Safari 12.1+) imply `noopener` and are unaffected. Defense-in-depth only.",
+                    ruleId: "crawler/tabnabbing", cwe: ["CWE-1022"],
+                    location: { url: r.finalUrl, snippet: truncate(`<a href="${a.href}" target="_blank">`, 200) },
+                  }));
+                }
               }
               if ((tag === "script" || tag === "img" || tag === "iframe" || tag === "link") && (a.src || a.href)) {
                 const src = a.src ?? a.href ?? "";
@@ -272,6 +291,7 @@ export const crawlerScanner: Scanner = {
           for (const m of r.body.matchAll(JS_ENDPOINT)) {
             try {
               const next = new URL(m[2], start).toString();
+              if (!isProbeableUrl(next)) continue; // skip templated `/api/${id}`-style hints
               apiHints.push({ url: next, source: url });
               ctx.discover({ kind: "endpoint", url: next, method: "GET", source: { scannerId: "web.crawler", via: "js-mine", parentUrl: url } });
               if (!seen.has(next) && pages.length < maxPages) {
@@ -282,7 +302,7 @@ export const crawlerScanner: Scanner = {
           for (const m of r.body.matchAll(FETCH_LITERAL)) {
             try {
               const next = new URL(m[1], start).toString();
-              if (next.startsWith(start.origin)) {
+              if (isProbeableUrl(next) && next.startsWith(start.origin)) {
                 apiHints.push({ url: next, source: `${url} (fetch)` });
                 ctx.discover({ kind: "endpoint", url: next, method: "GET", source: { scannerId: "web.crawler", via: "js-fetch-literal", parentUrl: url } });
                 if (!seen.has(next)) { seen.add(next); queue.push({ url: next, depth: depth + 1 }); }

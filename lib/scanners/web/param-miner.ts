@@ -17,8 +17,10 @@
 import { randomBytes } from "node:crypto";
 import { draft, type Scanner } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
+import { isProbeableUrl } from "../../web/url-hygiene";
 import { loadSiteMap, interestingPages } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
+import { measureBaseline, classifyDiff, type ProbeResp } from "./_oracle";
 
 const PARAMS = [
   // Generic ids
@@ -50,34 +52,6 @@ const PARAMS = [
   "csrf_token", "xsrf", "_token", "ref", "tag", "category",
   "version", "v", "ver", "build",
 ];
-
-interface BaselineSig {
-  status: number;
-  bodyLen: number;
-  headerSet: string;
-  bodyHead: string;
-  redirect: string | null;
-}
-
-function fingerprint(body: string, status: number, headers: Headers, redirectChain: string[]): BaselineSig {
-  const headerKeys = [...headers.keys()].sort().join(",");
-  return {
-    status,
-    bodyLen: body.length,
-    headerSet: headerKeys,
-    bodyHead: body.slice(0, 200),
-    redirect: redirectChain.length ? redirectChain[redirectChain.length - 1] : null,
-  };
-}
-
-function differs(a: BaselineSig, b: BaselineSig, canary: string, body: string): "canary-reflected" | "len-shift" | "redirect-shift" | "header-shift" | "status-shift" | null {
-  if (body.includes(canary)) return "canary-reflected";
-  if (a.status !== b.status) return "status-shift";
-  if (a.redirect !== b.redirect) return "redirect-shift";
-  if (a.headerSet !== b.headerSet) return "header-shift";
-  if (Math.abs(a.bodyLen - b.bodyLen) > Math.max(64, a.bodyLen * 0.05)) return "len-shift";
-  return null;
-}
 
 export const paramMinerScanner: Scanner = {
   id: "web.param-miner",
@@ -116,89 +90,112 @@ export const paramMinerScanner: Scanner = {
       ...(ctx.target.auth?.bearerToken ? { Authorization: `Bearer ${ctx.target.auth.bearerToken}` } : {}),
     });
 
+    // One probe = set `name=value` on the URL and read the response.
+    const probe = async (baseUrl: URL, name: string, value: string): Promise<ProbeResp | null> => {
+      const probeUrl = new URL(baseUrl.toString());
+      probeUrl.searchParams.set(name, value);
+      try {
+        const r = await session.fetch(probeUrl.toString(), { signal: ctx.signal });
+        const redirect = r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : null;
+        return { status: r.res.status, body: r.body, latencyMs: 0, redirect };
+      } catch {
+        return null;
+      }
+    };
+
     const total = urls.length * PARAMS.length;
     let done = 0;
 
     for (const u of urls) {
       if (ctx.signal.aborted) break;
+      if (!isProbeableUrl(u)) continue; // never mine a synthetic / pattern URL
       const baseUrl = new URL(u);
 
-      // Take TWO baselines so we know what same-page jitter looks like
-      // (dynamic timestamps, session cookies, csrf tokens, etc.). The
-      // detection threshold is then "diff bigger than baseline jitter".
-      let b1; try { b1 = await session.fetch(baseUrl.toString(), { signal: ctx.signal }); }
-      catch { continue; }
-      let b2; try { b2 = await session.fetch(baseUrl.toString(), { signal: ctx.signal }); }
-      catch { continue; }
-      const baseSig = fingerprint(b1.body, b1.res.status, b1.res.headers, b1.redirectChain);
-      const jitterLen = Math.abs(b1.body.length - b2.body.length);
-      // Required len-shift to count as signal: max(64, 5×jitter, 5% of body).
-      const lenThreshold = Math.max(64, jitterLen * 5, Math.floor(b1.body.length * 0.05));
+      // Two baselines establish the page's jitter + determinism. A page whose
+      // untouched responses already disagree on status / redirect (auth
+      // redirects, A/B buckets) cannot attribute a per-param change, so skip it.
+      const base = await measureBaseline(async () => {
+        try {
+          const r = await session.fetch(baseUrl.toString(), { signal: ctx.signal });
+          const redirect = r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : null;
+          return { status: r.res.status, body: r.body, latencyMs: 0, redirect } as ProbeResp;
+        } catch { return null; }
+      }, 2);
+      done += 2;
+      if (!base) continue;
+      if (base.unstable) {
+        await ctx.log("info", `${u}: non-deterministic baseline — skipping param-mining`);
+        continue;
+      }
 
-      // For each candidate param we try TWO values: a random canary (catches
-      // reflection / generic acceptance) and a "feature-flag" value (catches
-      // params like ?debug=1 or ?admin=true that only branch on specific
-      // truthy values). Either signal qualifies the param as accepted.
-      const FLAG_VALUES = ["1", "true", "on"];
-      const alive: { name: string; signal: string; value: string; bodySnippet: string; lenDelta: number }[] = [];
+      // NEGATIVE CONTROL — a parameter name the app cannot possibly handle. If
+      // this bogus param reflects its canary or shifts the response, the app
+      // echoes / reacts to ANY parameter, so per-param signals are NOT
+      // attributable to the name. This single check kills the URL-echo flood
+      // (109 "hidden params" on one page all reflecting the request URL).
+      const controlName = "zzq" + randomBytes(4).toString("hex");
+      const controlCanary = "moba" + randomBytes(3).toString("hex");
+      const controlResp = await probe(baseUrl, controlName, controlCanary);
+      done += 1;
+      const echoProne = controlResp ? controlResp.body.includes(controlCanary) : false;
+      const shiftProne = controlResp ? classifyDiff(base, controlResp) !== null : false;
+      if (echoProne && shiftProne) {
+        await ctx.log("info", `${u}: reacts to arbitrary params (URL echo) — suppressing param-mining`);
+        continue;
+      }
+
+      const signalFor = (resp: ProbeResp | null, canary: string): string | null => {
+        if (!resp) return null;
+        if (!echoProne && resp.body.includes(canary)) return "canary-reflected";
+        if (!shiftProne) { const s = classifyDiff(base, resp); if (s) return s; }
+        return null;
+      };
+
+      const alive: { name: string; signal: string; lenDelta: number; bodySnippet: string }[] = [];
       for (const name of PARAMS) {
         if (ctx.signal.aborted) break;
         if (baseUrl.searchParams.has(name)) continue;
         const canary = "moba" + randomBytes(3).toString("hex");
-        const valuesToTry = [canary, ...FLAG_VALUES];
-        for (const value of valuesToTry) {
-          const probeUrl = new URL(baseUrl.toString());
-          probeUrl.searchParams.set(name, value);
-          let r;
-          try { r = await session.fetch(probeUrl.toString(), { signal: ctx.signal }); }
-          catch { done += 1; continue; }
-          done += 1;
-          if (done % 30 === 0) await ctx.progress(done / total, `${u} +${name}=${value}`);
-          const sig = fingerprint(r.body, r.res.status, r.res.headers, r.redirectChain);
-
-          let signal: string | null = null;
-          if (value === canary && r.body.includes(canary)) signal = "canary-reflected";
-          else if (sig.status !== baseSig.status) signal = "status-shift";
-          else if (sig.redirect !== baseSig.redirect) signal = "redirect-shift";
-          else {
-            const lenDelta = Math.abs(r.body.length - baseSig.bodyLen);
-            if (lenDelta >= lenThreshold) signal = "len-shift";
-          }
-          if (signal) {
-            alive.push({ name, signal, value, bodySnippet: truncate(r.body, 200), lenDelta: r.body.length - baseSig.bodyLen });
-            // Don't probe further values once one has triggered for this name.
-            break;
-          }
-        }
+        const resp = await probe(baseUrl, name, canary);
+        done += 1;
+        if (done % 30 === 0) await ctx.progress(Math.min(done / total, 0.99), `${u} +${name}`);
+        const signal = signalFor(resp, canary);
+        if (!signal) continue;
+        // RE-CONFIRM — the signal must reproduce on a fresh, differently-seeded
+        // probe. Drops one-shot flukes from transient variance.
+        const canary2 = "moba" + randomBytes(3).toString("hex");
+        const resp2 = await probe(baseUrl, name, canary2);
+        done += 1;
+        if (signalFor(resp2, canary2) !== signal) continue;
+        alive.push({ name, signal, lenDelta: (resp!.body.length - base.len), bodySnippet: truncate(resp!.body, 200) });
       }
 
       if (alive.length === 0) continue;
 
-      // Even with the noise filter, if a *very high* fraction of probes alive
-      // on a single URL with the same signal, the page is likely just
-      // unstable; skip rather than flood.
-      const lenShiftCount = alive.filter((a) => a.signal === "len-shift").length;
-      if (lenShiftCount > PARAMS.length * 0.4) {
-        await ctx.log("info", `${u}: ${lenShiftCount} len-shifts — likely unstable page, suppressing`);
+      // Plausibility backstop: a page that "accepts" a large fraction of a
+      // generic wordlist is unstable in a way the control missed, not a trove
+      // of hidden params. Suppress rather than flood.
+      if (alive.length > Math.max(6, PARAMS.length * 0.25)) {
+        await ctx.log("info", `${u}: ${alive.length}/${PARAMS.length} params 'accepted' — implausible, suppressing`);
         continue;
       }
 
       for (const a of alive) {
-        const isFlag = ["1", "true", "on"].includes(a.value);
-        const sev: "high" | "medium" | "low" =
-          a.signal === "canary-reflected" ? "high" :
-          isFlag ? "medium" :
-          a.signal === "redirect-shift" || a.signal === "status-shift" ? "medium" : "low";
+        const reflected = a.signal === "canary-reflected";
         await ctx.emit(draft({
-          severity: sev,
-          confidence: a.signal === "canary-reflected" ? "high" : "medium",
-          title: `Hidden parameter accepted: "${a.name}=${a.value}" (${a.signal}) on ${u}`,
-          description: `The app accepts a parameter named "${a.name}" that wasn't visible in any link/form on the page. Probing value="${a.value}" produced a different response (${a.signal}; len Δ ${a.lenDelta}).${a.signal === "canary-reflected" ? " Canary reflected — strong reflection / potential XSS surface." : isFlag ? " Looks like a feature/debug flag the app honors silently." : ""}`,
+          severity: reflected ? "medium" : "low",
+          confidence: reflected ? "high" : "medium",
+          title: `Hidden parameter accepted: "${a.name}" (${a.signal}) on ${u}`,
+          description: `The app reacts to a parameter "${a.name}" not visible in any link/form. The reaction reproduced on a re-probe while a random control parameter stayed silent (${a.signal}; len Δ ${a.lenDelta}).${reflected ? " The value is reflected in the response — worth fuzzing for XSS / open-redirect with the injection scanners." : ""}`,
           ruleId: `param-miner/${a.signal}`,
-          cwe: a.signal === "canary-reflected" ? ["CWE-79", "CWE-200"] : ["CWE-200"],
+          cwe: ["CWE-200"],
           owasp: ["A05:2021"],
-          location: { url: u, snippet: `?${a.name}=${a.value}` },
-          evidence: { baseline: { len: baseSig.bodyLen, status: baseSig.status, jitter: jitterLen }, probe: { signal: a.signal, value: a.value, lenDelta: a.lenDelta, snippet: a.bodySnippet } },
+          location: { url: u, snippet: `?${a.name}=` },
+          evidence: {
+            baseline: { len: base.len, status: base.status, jitter: base.jitter },
+            control: { name: controlName, reflected: echoProne, shifted: shiftProne },
+            probe: { signal: a.signal, lenDelta: a.lenDelta, reconfirmed: true, snippet: a.bodySnippet },
+          },
           remediation: "Audit what this parameter does. If it's a debug/feature flag, gate it behind auth or remove it. If it's a redirect/file loader, validate the value against an allow-list.",
         }));
       }

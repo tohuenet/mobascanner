@@ -29,20 +29,16 @@
 
 import { draft, type Scanner } from "../../engine/scanner";
 import type { HttpMethod } from "../../engine/discovery";
+import type { BrowserContext } from "playwright-core";
 import { safeUrl } from "../common";
 import { loadProfile } from "../../auth/profile";
+import { acquireBrowser, acquireContext, releaseBrowser, liveBrowserEndpoint, REALISTIC_UA, type AcquiredBrowser } from "../../web/browser";
 import {
   harvestDom,
   runInteractionPass,
   type HarvestedForm,
   type InteractionStats,
 } from "./_interaction";
-
-let chromiumPromise: Promise<typeof import("playwright-core").chromium> | null = null;
-async function getChromium() {
-  if (!chromiumPromise) chromiumPromise = import("playwright-core").then((m) => m.chromium);
-  return chromiumPromise;
-}
 
 const HTTP_METHODS: ReadonlySet<HttpMethod> = new Set([
   "GET",
@@ -129,44 +125,42 @@ export const spaCrawlerScanner: Scanner = {
     );
     const globalBudget = { remaining: globalInteractionCap };
 
-    let chromium: Awaited<ReturnType<typeof getChromium>>;
+    // Attach to the user's real Chrome (live-browser mode) when configured,
+    // else launch our own headless Chromium.
+    const cdpUrl = liveBrowserEndpoint(undefined);
+    let acq: AcquiredBrowser;
     try {
-      chromium = await getChromium();
-    } catch (e) {
-      await ctx.log(
-        "error",
-        `playwright-core failed to load: ${e instanceof Error ? e.message : e}. Open the scan-setup page → Captured session → Install Chromium.`,
-      );
-      return;
-    }
-
-    let browser: Awaited<ReturnType<typeof chromium.launch>>;
-    try {
-      browser = await chromium.launch({ headless: true });
+      acq = await acquireBrowser({ cdpUrl, headless: true });
+      if (acq.attached) await ctx.log("info", `attached to live browser at ${acq.endpoint} — crawling with your real session`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       await ctx.log(
         "error",
-        `chromium launch failed: ${msg}. Open the scan-setup page → Captured session → Install Chromium (one click).`,
+        cdpUrl
+          ? `could not attach to browser at ${cdpUrl}: ${msg}. Launch Chrome with --remote-debugging-port=9222 (see docs/live-browser.md).`
+          : `chromium launch failed: ${msg}. Open the scan-setup page → Captured session → Install Chromium (one click).`,
       );
       await ctx.emit(draft({
         severity: "info",
         confidence: "high",
-        title: "SPA crawler skipped — Chromium not installed",
-        description:
-          "Open /scan/web → Authentication → Captured session and use the Install Chromium button. Then re-run with web.spa-crawler enabled.",
+        title: cdpUrl ? "SPA crawler skipped — could not attach to live browser" : "SPA crawler skipped — Chromium not installed",
+        description: cdpUrl
+          ? "Live-browser mode is configured but the CDP endpoint was unreachable. Launch Chrome with `--remote-debugging-port=9222` and set MOBA_BROWSER_CDP_URL. See docs/live-browser.md."
+          : "Open /scan/web → Authentication → Captured session and use the Install Chromium button. Then re-run with web.spa-crawler enabled.",
         ruleId: "spa-crawler/no-chromium",
         location: { url: ctx.target.value },
       }));
       return;
     }
 
+    let crawlContext: BrowserContext | undefined;
+    let ownsContext = false;
     try {
       const profileId = ctx.target.auth?.profileId;
-      const storageState = profileId
+      const storageState = profileId && !acq.attached
         ? (await loadProfile(profileId).catch(() => null)) ?? undefined
         : undefined;
-      if (profileId) {
+      if (profileId && !acq.attached) {
         await ctx.log(
           "info",
           storageState
@@ -175,13 +169,10 @@ export const spaCrawlerScanner: Scanner = {
         );
       }
 
-      const context = await browser.newContext({
-        userAgent: "moba-scanner/0.1 (+spa-crawler)",
-        ignoreHTTPSErrors: true,
-        storageState: storageState as Parameters<typeof browser.newContext>[0] extends infer C
-          ? C extends { storageState?: infer S } ? S : never
-          : never,
-      });
+      const acquired = await acquireContext(acq, { userAgent: REALISTIC_UA, storageState, ignoreHTTPSErrors: true });
+      const context = acquired.context;
+      crawlContext = acquired.context;
+      ownsContext = acquired.ownsContext;
 
       const seen = new Set<string>([start.toString()]);
       const queue: string[] = [start.toString()];
@@ -357,8 +348,6 @@ export const spaCrawlerScanner: Scanner = {
         }
       }
 
-      await context.close().catch(() => undefined);
-
       const totalForms = formHits + ix.revealedForms;
       await ctx.emit(draft({
         severity: "info",
@@ -399,7 +388,8 @@ export const spaCrawlerScanner: Scanner = {
         },
       }));
     } finally {
-      await browser.close().catch(() => undefined);
+      // Close only what we own — never close the user's attached browser/context.
+      await releaseBrowser(acq, ownsContext, crawlContext);
     }
 
     await ctx.progress(1, "spa-crawler done");

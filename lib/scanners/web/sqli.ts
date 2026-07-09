@@ -29,11 +29,11 @@
  * the probe causes a deterministic, attacker-controllable side-effect.
  */
 
-import { randomBytes } from "node:crypto";
 import { draft, type Scanner } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
 import { loadSiteMap, type SiteMapForm } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
+import { measureBaseline, booleanBlindHit, type ProbeResp } from "./_oracle";
 
 // ─────────────────────────── DBMS fingerprints ──────────────────────────
 const DB_ERROR_PATTERNS: { dbms: string; re: RegExp }[] = [
@@ -305,35 +305,48 @@ export const sqliScanner: Scanner = {
       }
 
       // ─── Boolean-based blind ─────────────────────────────────────
-      // We require that probes for "true" and "false" produce DIFFERENT
-      // responses, AND the "true" probe matches the baseline, AND the "false"
-      // probe does NOT match the baseline. This filters most generic
-      // 200-on-everything endpoints.
+      // The naive "TRUE≈baseline, FALSE≠baseline" rule is fooled by (a) a
+      // blocked/empty FALSE probe (a WAF dropping `) AND (1=2` to 0 bytes reads
+      // as "SQL false"), and (b) a page whose own jitter exceeds the effect
+      // size. We defend with `booleanBlindHit`: it rejects non-signal probes and
+      // measures the length noise from repeated benign baselines, then requires
+      // the hit to REPRODUCE on a second pair before emitting.
       if (!fired.has(`${pointId(point)}|error`)) {
-        for (const bp of BOOLEAN_PAYLOADS) {
-          if (ctx.signal.aborted) break;
-          const truR = await probe(session, point, "1" + bp.tru, ctx.signal);
-          const falR = await probe(session, point, "1" + bp.fal, ctx.signal);
-          if (!truR || !falR) continue;
-          const lenDeltaTF = Math.abs(truR.body.length - falR.body.length);
-          const lenDeltaTB = Math.abs(truR.body.length - baseline.body.length);
-          const lenDeltaFB = Math.abs(falR.body.length - baseline.body.length);
-          // Strong signal: TRUE ≈ baseline, FALSE far from baseline AND from TRUE.
-          const baselineLen = Math.max(baseline.body.length, 1);
-          if (lenDeltaTF > Math.max(40, baselineLen * 0.05) &&
-              lenDeltaTB < Math.max(20, baselineLen * 0.02) &&
-              lenDeltaFB > Math.max(40, baselineLen * 0.05)) {
+        const asResp = (r: { status: number; body: string; latencyMs: number } | null): ProbeResp | null =>
+          r ? { status: r.status, body: r.body, latencyMs: r.latencyMs, redirect: null } : null;
+        const boolBase = await measureBaseline(
+          async () => asResp(await probe(session, point, "1", ctx.signal)),
+          2,
+        );
+        // A non-deterministic or un-baselineable point can't support a
+        // length-differential oracle — skip boolean-blind for it entirely.
+        if (boolBase && !boolBase.unstable) {
+          for (const bp of BOOLEAN_PAYLOADS) {
+            if (ctx.signal.aborted) break;
+            const tru = asResp(await probe(session, point, "1" + bp.tru, ctx.signal));
+            const fal = asResp(await probe(session, point, "1" + bp.fal, ctx.signal));
+            if (!booleanBlindHit(boolBase, tru, fal)) continue;
+            // RE-CONFIRM: a genuine conditional reproduces; transient variance
+            // usually does not.
+            const tru2 = asResp(await probe(session, point, "1" + bp.tru, ctx.signal));
+            const fal2 = asResp(await probe(session, point, "1" + bp.fal, ctx.signal));
+            if (!booleanBlindHit(boolBase, tru2, fal2)) continue;
             const key = `${pointId(point)}|boolean`;
             if (fired.has(key)) break;
             fired.add(key);
             await ctx.emit(draft({
               severity: "critical", confidence: "medium",
               title: `Boolean-based blind SQLi on ${pointHumanLabel(point)} (${bp.label})`,
-              description: `Probe \`${bp.tru}\` produced a response equivalent to the benign baseline; \`${bp.fal}\` produced a different one — strong evidence of conditional SQL evaluation.`,
+              description: `\`${bp.tru}\` produced a response equivalent to the benign baseline while \`${bp.fal}\` diverged beyond the page's measured jitter — and the difference reproduced on a second pair. Strong evidence of conditional SQL evaluation.`,
               ruleId: `sqli/boolean/${bp.label}`,
               cwe: ["CWE-89"], owasp: ["A03:2021"],
               location: pointLocation(point),
-              evidence: { tru: bp.tru, fal: bp.fal, baselineLen: baseline.body.length, truLen: truR.body.length, falLen: falR.body.length },
+              evidence: {
+                tru: bp.tru, fal: bp.fal,
+                baselineLen: boolBase.len, jitter: boolBase.jitter,
+                truLen: tru!.body.length, falLen: fal!.body.length,
+                truLen2: tru2!.body.length, falLen2: fal2!.body.length,
+              },
               remediation: "Use parameterized queries. Bool-blind SQLi enables full data extraction one bit at a time.",
             }));
             break;

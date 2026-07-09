@@ -61,6 +61,7 @@ export const ldapInjectionScanner: Scanner = {
 
       for (const p of LDAP_PROBES) {
         if (ctx.signal.aborted) break;
+        const before = new Set(session.observedSetCookies.map((c) => c.raw.split("=")[0].trim()));
         const body = new URLSearchParams();
         for (const i of form.inputs) body.set(i.name, i.value || "x");
         body.set(userField, p.user); body.set(passField, p.pass);
@@ -68,10 +69,18 @@ export const ldapInjectionScanner: Scanner = {
         try { r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: body.toString(), signal: ctx.signal }); }
         catch { continue; }
         const errorMatch = LDAP_ERROR_RE.test(r.body) && !LDAP_ERROR_RE.test(baseline.body);
-        const looksAuthOk = r.redirectChain.length > 0 && session.observedSetCookies.length > 0;
-        const lenDelta = Math.abs(r.body.length - baseline.body.length);
-        const looksDifferent = lenDelta > Math.max(64, baseline.body.length * 0.05);
-        if (errorMatch || (looksAuthOk && looksDifferent)) {
+        // Affirmative auth-bypass: a NEW session/auth cookie (not the cumulative
+        // jar) AND a redirect to a non-login page AND no failure marker. The old
+        // `redirect + any cookie + fixed-length-delta` fired on failed logins
+        // that 302 back to /login while a tracking cookie was already set.
+        const newAuthCookie = session.observedSetCookies
+          .map((c) => c.raw.split("=")[0].trim())
+          .some((n) => /(sess|sid|auth|token|jwt|login|_session)/i.test(n) && !before.has(n));
+        const dest = r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : "";
+        const authBypass = newAuthCookie && !!dest &&
+          !/login|signin|sign-in|error|denied/i.test(dest) &&
+          !/invalid|incorrect|wrong|denied|failed/i.test(r.body);
+        if (errorMatch || authBypass) {
           await ctx.emit(draft({
             severity: "critical", confidence: errorMatch ? "high" : "medium",
             title: `LDAP injection on ${form.action} (${p.label})`,

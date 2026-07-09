@@ -156,11 +156,17 @@ export const fileUploadScanner: Scanner = {
             signal: ctx.signal,
           });
         } catch { continue; }
-        // Heuristic: server returns 200 + the filename / a "stored at" path / canary echo.
+        // Server returns 200 + the filename / a "stored at" path / canary echo.
         const lower = r.body.toLowerCase();
         const filenameEcho = lower.includes(a.filename.toLowerCase());
-        const accepted = (r.res.status >= 200 && r.res.status < 300) &&
-          (filenameEcho || /stored|saved|uploaded|upload\s+complete/i.test(r.body));
+        // A rejection page frequently ECHOES the filename ("`x.php.jpg` is not
+        // allowed") or says "file was not saved". Treating those as acceptance
+        // was a critical false positive, so a negation/rejection anywhere in the
+        // body vetoes acceptance.
+        const rejected = /\bnot\s+(allowed|permitted|saved|uploaded|accepted|supported)\b|n['’]?t\s+(be\s+)?(saved|uploaded|allowed|accepted)|\b(invalid|rejected|forbidden|denied|failed|disallowed|blocked|too\s+large|unsupported|error)\b/i.test(r.body);
+        const successPhrase = /\b(stored|saved|uploaded|upload\s+complete|success|file\s+received)\b/i.test(r.body);
+        const accepted = (r.res.status >= 200 && r.res.status < 300) && !rejected &&
+          (successPhrase || (filenameEcho && /\/(uploads?|files?|media|assets|images?)\//i.test(r.body)));
         if (accepted) {
           await ctx.emit(draft({
             severity: a.severity, confidence: filenameEcho ? "high" : "medium",

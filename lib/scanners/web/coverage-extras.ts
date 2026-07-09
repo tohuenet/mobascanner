@@ -177,7 +177,7 @@ export const hppScanner: Scanner = {
       const u = safeUrl(p.url); if (!u) continue;
       for (const param of u.searchParams.keys()) {
         // Single value baseline.
-        let baselineUrl = new URL(u.toString());
+        const baselineUrl = new URL(u.toString());
         baselineUrl.searchParams.set(param, "ok");
         let baseline;
         try { baseline = await session.fetch(baselineUrl.toString(), { signal: ctx.signal }); } catch { continue; }
@@ -187,13 +187,16 @@ export const hppScanner: Scanner = {
         try { r = await session.fetch(pollutedUrl, { signal: ctx.signal }); } catch { continue; }
         done++;
         const lenDelta = Math.abs(r.body.length - baseline.body.length);
+        // Only the REFLECTION signal is trustworthy: the app read the second
+        // (polluted) value and echoed it. A bare length change fires on any
+        // dynamic page (ads, tokens, timestamps), so we no longer emit on it.
         const canaryReflected = r.body.includes(canary);
-        if (canaryReflected || lenDelta > Math.max(64, baseline.body.length * 0.05)) {
+        if (canaryReflected) {
           await ctx.emit(draft({
-            severity: canaryReflected ? "medium" : "low",
-            confidence: canaryReflected ? "high" : "medium",
+            severity: "medium",
+            confidence: "high",
             title: `HTTP Parameter Pollution on "${param}" of ${u.pathname}`,
-            description: `Duplicating parameter \`${param}\` changed the response${canaryReflected ? " AND the second value was reflected — input validation likely runs against the first value while the app reads the second" : ""}.`,
+            description: `Duplicating parameter \`${param}\` caused the SECOND value to be reflected — input validation likely runs against the first value while the app reads the second.`,
             ruleId: "hpp/duplicate-param",
             cwe: ["CWE-235"], owasp: ["A03:2021"],
             location: { url: pollutedUrl, snippet: param },
@@ -359,14 +362,20 @@ export const emailAuthScanner: Scanner = {
 };
 
 // ─────────────────────── Cloud metadata variants ─────────────────────
+// Markers must be strings that appear in the metadata RESPONSE but NOT in the
+// URL we inject — otherwise an app that simply echoes the parameter value trips
+// them (the old `instance` / `apiVersion` / bare-base64 markers matched "for
+// instance", any OpenAPI doc, and any token). The detector additionally rejects
+// a marker that also matches the injected URL (echo) and one already present in
+// a benign baseline.
 const META_PROBES: { name: string; url: string; marker: RegExp }[] = [
   { name: "AWS IMDSv1", url: "http://169.254.169.254/latest/meta-data/", marker: /ami-id|instance-id|iam\/security-credentials/i },
-  { name: "AWS IMDSv2 (token)", url: "http://169.254.169.254/latest/api/token", marker: /AQAEA|^[A-Za-z0-9+/=]{40,}$/ },
-  { name: "Azure IMDS", url: "http://169.254.169.254/metadata/instance?api-version=2021-02-01", marker: /"compute"|"network"|"vmId"/ },
-  { name: "GCP metadata", url: "http://metadata.google.internal/computeMetadata/v1/", marker: /computeMetadata|service-accounts|instance/ },
-  { name: "Alibaba/Aliyun", url: "http://100.100.100.200/latest/meta-data/", marker: /instance-id|ram\//i },
+  { name: "AWS IMDSv2 (token)", url: "http://169.254.169.254/latest/api/token", marker: /\bAQAEA[A-Za-z0-9_-]{8,}/ },
+  { name: "Azure IMDS", url: "http://169.254.169.254/metadata/instance?api-version=2021-02-01", marker: /"vmId"|"subscriptionId"|"resourceGroupName"/ },
+  { name: "GCP metadata", url: "http://metadata.google.internal/computeMetadata/v1/", marker: /service-accounts\/|numeric-project-id|oslogin/i },
+  { name: "Alibaba/Aliyun", url: "http://100.100.100.200/latest/meta-data/", marker: /instance-id|ram\/security-credentials/i },
   { name: "DigitalOcean", url: "http://169.254.169.254/metadata/v1.json", marker: /"droplet_id"|"public_keys"/ },
-  { name: "Kubernetes API", url: "https://kubernetes.default.svc/api/v1", marker: /apiVersion|kind:.*?APIVersions/ },
+  { name: "Kubernetes API", url: "https://kubernetes.default.svc/api/v1", marker: /serverAddressByClientCIDRs|"kind"\s*:\s*"APIVersions"|APIResourceList/ },
 ];
 
 export const cloudMetaScanner: Scanner = {
@@ -395,6 +404,14 @@ export const cloudMetaScanner: Scanner = {
     let done = 0;
     for (const t of targets) {
       if (ctx.signal.aborted) break;
+      // Baseline: inject a benign external URL. Any marker already present here
+      // is page noise, not SSRF.
+      let baselineBody = "";
+      try {
+        const bu = new URL(t.url.toString());
+        bu.searchParams.set(t.param, "https://moba-baseline.example/");
+        baselineBody = (await session.fetch(bu.toString(), { signal: ctx.signal })).body;
+      } catch { /* proceed without baseline */ }
       for (const probe of META_PROBES) {
         const u = new URL(t.url.toString());
         u.searchParams.set(t.param, probe.url);
@@ -409,7 +426,9 @@ export const cloudMetaScanner: Scanner = {
           });
         } catch { continue; }
         done++;
-        if (probe.marker.test(r.body)) {
+        // Real SSRF: the marker appears in the response, is NOT just the echoed
+        // injected URL, and was absent from the benign baseline.
+        if (r.body.length > 0 && probe.marker.test(r.body) && !probe.marker.test(probe.url) && !probe.marker.test(baselineBody)) {
           await ctx.emit(draft({
             severity: "critical", confidence: "high",
             title: `SSRF → ${probe.name} metadata leaked via parameter "${t.param}"`,
@@ -467,29 +486,42 @@ export const userEnumScanner: Scanner = {
         } catch { return null; }
       };
 
-      const baseline = await probe(INVALID);
-      if (!baseline) continue;
-      const results: NonNullable<Awaited<ReturnType<typeof probe>>>[] = [];
+      // Measure the invalid-username response 3× to learn its OWN jitter — a
+      // CSRF token / timestamp makes it vary between identical requests, which
+      // the old single-sample 5%/800ms thresholds mistook for enumeration.
+      const invalidSamples: NonNullable<Awaited<ReturnType<typeof probe>>>[] = [];
+      for (let i = 0; i < 3; i++) { const s = await probe(INVALID); if (s) invalidSamples.push(s); }
+      if (invalidSamples.length < 2) continue;
+      const lens = invalidSamples.map((s) => s.len).sort((a, b) => a - b);
+      const baselineLen = lens[Math.floor(lens.length / 2)];
+      const lenJitter = Math.max(...invalidSamples.map((s) => Math.abs(s.len - baselineLen)));
+      const baselineStatus = invalidSamples[0].status;
+      const statusStable = invalidSamples.every((s) => s.status === baselineStatus);
+      const lenThreshold = Math.max(64, lenJitter * 3);
+      const differsFromInvalid = (r: { status: number; len: number }) =>
+        (statusStable && r.status !== baselineStatus) || Math.abs(r.len - baselineLen) > lenThreshold;
+
+      // NOTE: no timing arm — a length/latency timing side channel needs many
+      // samples and statistics; a single >800ms delta is just network jitter.
+      const distinguishable: NonNullable<Awaited<ReturnType<typeof probe>>>[] = [];
       for (const u of COMMON_USERS) {
         const r = await probe(u);
-        if (r) results.push(r);
+        if (!r || !differsFromInvalid(r)) continue;
+        // Re-confirm the difference reproduces (drops one-off variance).
+        const r2 = await probe(u);
+        if (r2 && differsFromInvalid(r2)) distinguishable.push(r);
       }
-
-      const distinguishable = results.filter((r) =>
-        r.status !== baseline.status ||
-        Math.abs(r.len - baseline.len) > Math.max(40, baseline.len * 0.05) ||
-        Math.abs(r.ms - baseline.ms) > Math.max(800, baseline.ms * 2));
 
       if (distinguishable.length >= 1) {
         await ctx.emit(draft({
           severity: "low", confidence: "medium",
           title: `Username enumeration on ${form.action}`,
-          description: `Login responses for invalid username vs ${distinguishable.map((d) => `"${d.user}"`).join(" / ")} are distinguishable (status / length / timing). Attackers can enumerate valid accounts before brute-forcing.`,
+          description: `Login responses for invalid username vs ${distinguishable.map((d) => `"${d.user}"`).join(" / ")} differ in status/length beyond the invalid-response's own jitter, and the difference reproduced. Attackers can enumerate valid accounts before brute-forcing.`,
           ruleId: "auth/user-enum",
           cwe: ["CWE-204", "CWE-203"], owasp: ["A07:2021"],
           location: { url: form.action },
           evidence: {
-            invalid: { status: baseline.status, len: baseline.len, ms: baseline.ms },
+            invalid: { status: baselineStatus, medianLen: baselineLen, lenJitter },
             distinguishable: distinguishable.map((d) => ({ user: d.user, status: d.status, len: d.len, ms: d.ms })),
           },
           remediation: "Make the login response identical for valid and invalid usernames (same body, same status, ideally same timing).",
@@ -529,11 +561,16 @@ export const deserializationScanner: Scanner = {
     const RULES: { lang: string; sig: RegExp; severity: "high" | "medium" | "low" }[] = [
       { lang: "Java (serialized)", sig: /\brO0[A-Za-z0-9+/=]{6,}/, severity: "high" },           // base64-encoded `\xAC\xED\x00\x05`
       { lang: "Java (raw)",        sig: /\xAC\xED\x00\x05/, severity: "high" },
-      { lang: "PHP (serialize)",   sig: /(?:^|[=&"; >])(?:O|a|s|i|d|b|N):[\d:"{};]{4,}/, severity: "high" },
+      // Anchored to a real PHP OBJECT serialization frame `O:<len>:"Class":<n>:{`
+      // — the RCE-relevant shape. The old loose `(O|a|s|i|d|b|N):…` matched
+      // inline JSON/CSS/`i:1` fragments on any page.
+      { lang: "PHP (serialize)",   sig: /(?:^|[=&"; >])O:\d+:"[^"]+":\d+:\{/, severity: "high" },
       { lang: "Python (pickle)",   sig: /\x80[\x02-\x05]/, severity: "high" },
       { lang: ".NET BinaryFormatter", sig: /\bAAEAAA[A-Za-z0-9+/=]{20,}/, severity: "high" },
       { lang: "Ruby Marshal",      sig: /\x04\x08[\x00-\xff]{4,}/, severity: "medium" },
-      { lang: "YAML (Ruby/Python)", sig: /^---|!ruby\/object|!!python\/object/m, severity: "medium" },
+      // Dangerous YAML TAGS only — the bare `^---` document marker matched
+      // license banners, markdown rules, and source-map comments.
+      { lang: "YAML (Ruby/Python)", sig: /!ruby\/object|!!python\/object|!!python\/name/, severity: "medium" },
     ];
 
     for (const c of candidates) {

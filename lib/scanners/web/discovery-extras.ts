@@ -47,17 +47,31 @@ export const cacheDeceptionScanner: Scanner = {
     for (const p of targets) {
       if (ctx.signal.aborted) break;
       const baseline = await session.fetch(p.url, { signal: ctx.signal }).catch(() => null);
-      if (!baseline) continue;
+      if (!baseline || baseline.body.length === 0) continue;
+      // Does this page actually serve USER-SPECIFIC content? Compare the authed
+      // baseline to an ANONYMOUS fetch. If they're identical (a public SPA
+      // shell), caching a copy leaks nothing — the classic cache-deception false
+      // positive. Without auth configured, authed==anon, so nothing is flagged
+      // (correct: you can't demonstrate the leak without a user session).
+      const anon = await new BrowsingSession(seed.origin).fetch(p.url, { signal: ctx.signal }).catch(() => null);
+      const userSpecific = !anon || anon.res.status !== baseline.res.status ||
+        Math.abs(anon.body.length - baseline.body.length) > Math.max(64, baseline.body.length * 0.05);
+      if (!userSpecific) continue;
       for (const ext of EXTS) {
         const probeUrl = p.url.replace(/\?.*$/, "") + ext;
         let r;
         try { r = await session.fetch(probeUrl, { signal: ctx.signal }); }
         catch { continue; }
+        if (r.body.length === 0) continue;
         const cacheable = /public|max-age=\d+/i.test(r.res.headers.get("cache-control") ?? "") ||
           !!r.res.headers.get("age") ||
           /HIT/i.test(r.res.headers.get("x-cache") ?? "");
-        const sameContent = Math.abs(r.body.length - baseline.body.length) < Math.max(50, baseline.body.length * 0.1);
-        if (r.res.status === 200 && sameContent && cacheable) {
+        // The DYNAMIC page must be served under the static URL — content-type
+        // html/json, not the static type the extension implies. A real `.css`
+        // (text/css) is not deception.
+        const servedDynamic = /text\/html|application\/(json|xhtml)/.test((r.res.headers.get("content-type") ?? "").toLowerCase());
+        const sameContent = Math.abs(r.body.length - baseline.body.length) < Math.max(64, baseline.body.length * 0.1);
+        if (r.res.status === 200 && sameContent && cacheable && servedDynamic) {
           await ctx.emit(draft({
             severity: "high", confidence: "medium",
             title: `Cache deception: ${probeUrl} returns same dynamic content as ${p.url} AND is cacheable`,
@@ -109,12 +123,26 @@ export const backupFilesScanner: Scanner = {
     let probed = 0;
     for (const url of targets) {
       if (ctx.signal.aborted) break;
+      // Soft-404 control: a bogus suffix that CANNOT exist. If the server still
+      // answers it with "200 + non-HTML body", it 200s everything (API/catch-all
+      // soft-404) and every backup probe would be a false positive — skip.
+      let softNotFound = false;
+      let controlLen = -1;
+      try {
+        const c = await session.fetch(url + ".mobacontrol404nx", { signal: ctx.signal });
+        softNotFound = c.res.status === 200 && c.body.length > 64 && !/<html|<!doctype/i.test(c.body);
+        controlLen = c.body.length;
+      } catch { /* ignore */ }
+      if (softNotFound) continue;
       for (const suf of BACKUP_SUFFIXES) {
         let r;
         try { r = await session.fetch(url + suf, { signal: ctx.signal }); }
         catch { continue; }
         probed++;
-        if (r.res.status === 200 && r.body.length > 64 && !/<html|<!doctype/i.test(r.body)) {
+        // Also require the body to differ from the control (guards a soft-404
+        // that only sometimes trips the HTML check).
+        const differsFromControl = controlLen < 0 || Math.abs(r.body.length - controlLen) > 32;
+        if (r.res.status === 200 && r.body.length > 64 && differsFromControl && !/<html|<!doctype/i.test(r.body)) {
           await ctx.emit(draft({
             severity: "high", confidence: "medium",
             title: `Backup file exposed: ${url}${suf}`,
@@ -355,15 +383,19 @@ export const numericBoundsScanner: Scanner = {
           let r;
           try { r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: probeBody.toString(), signal: ctx.signal }); }
           catch { continue; }
-          // Heuristic: accepted = same shape response as baseline AND no rejection word.
+          // "Not rejected" is NOT "accepted & honored" — a server may silently
+          // clamp the value. Require corroboration: the boundary value is echoed
+          // back (redisplayed/stored) AND no rejection word AND the response
+          // kept the baseline's shape. Even then this is a low-confidence hint.
+          const echoed = r.body.includes(bad);
           const accepted = r.res.status === baseline.res.status &&
             r.res.status < 400 &&
+            echoed &&
             !/invalid|negative|out of range|must be positive|exceeds|too large/i.test(r.body) &&
-            // For -ve / huge, expect rejection; if baseline body is similar to probe body, value was silently accepted.
-            Math.abs(r.body.length - baseline.body.length) < Math.max(50, baseline.body.length * 0.1);
+            Math.abs(r.body.length - baseline.body.length) < Math.max(64, baseline.body.length * 0.1);
           if (accepted) {
             await ctx.emit(draft({
-              severity: bad === "-1" || bad.startsWith("-") || bad === "1e10" || bad === "9999999999" ? "high" : "low",
+              severity: bad === "-1" || bad.startsWith("-") || bad === "1e10" || bad === "9999999999" ? "medium" : "low",
               confidence: "low",
               title: `Numeric bounds accepted: ${field.name}=${bad} on ${form.action}`,
               description: `Form accepted unusual numeric value \`${bad}\` without rejection. For amount/balance/quantity fields, this enables negative-value transactions / overflow / coupon stacking.`,

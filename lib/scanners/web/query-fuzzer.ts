@@ -18,6 +18,7 @@
 import { randomBytes } from "node:crypto";
 import { draft, type Scanner, type ScanContext, type DiscoveredItem } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
+import { isProbeableUrl } from "../../web/url-hygiene";
 import { loadSiteMap } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
 import { buildProbes, effectiveRule, type Probe } from "./_probes";
@@ -85,6 +86,10 @@ async function fuzzUrl(
   } catch {
     return 0;
   }
+  // Never fuzz a synthetic / robots-glob URL — its unstable 404 body feeds the
+  // reflection and length-diff detectors false positives. Gates both the static
+  // candidate list and the DiscoveryBus consume() path.
+  if (!isProbeableUrl(rawUrl)) return 0;
   const paramKeys = [...parsed.searchParams.keys()];
   if (paramKeys.length === 0) return 0;
 

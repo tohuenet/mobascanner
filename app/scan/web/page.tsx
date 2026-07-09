@@ -49,6 +49,16 @@ export default function WebScanPage() {
   const [auth, setAuth] = useState<AuthValue>({ mode: "none" });
   const [maxPages, setMaxPages] = useState(25);
   const [aggressive, setAggressive] = useState(false);
+  // Live-browser mode: attach to the user's real Chrome over CDP so the crawl
+  // rides their logged-in session and dodges bot-detection / CAPTCHA walls.
+  const [liveBrowser, setLiveBrowser] = useState(false);
+  const [cdpUrl, setCdpUrl] = useState("http://127.0.0.1:9222");
+  const [cdpTest, setCdpTest] = useState<
+    | null
+    | { testing: true }
+    | { ok: true; cookieCount?: number; targetCookies?: number; userAgent?: string | null }
+    | { ok: false; error: string }
+  >(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selector, setSelector] = useState<ScannerSelectorState>({ enabled: {} });
@@ -59,6 +69,22 @@ export default function WebScanPage() {
   // until one exists, otherwise the scan would silently run unauthenticated.
   const profileModeIncomplete = auth.mode === "profile" && !auth.profileId;
   const canSubmit = target.startsWith("http") && !submitting && !profileModeIncomplete;
+
+  /** Probe the CDP endpoint so the user knows their browser is reachable and
+   *  logged in before they commit a whole scan to it. */
+  async function testCdp() {
+    setCdpTest({ testing: true });
+    try {
+      const r = await fetch("/api/live-browser/check", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cdpUrl: cdpUrl.trim(), url: target }),
+      }).then((res) => res.json());
+      setCdpTest(r);
+    } catch (e) {
+      setCdpTest({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
 
   /** Performs the actual /api/scans POST. Split out so "Scan anyway" can reuse it. */
   async function submitScan() {
@@ -77,6 +103,11 @@ export default function WebScanPage() {
             type: "url",
             ...(authPayload ? { auth: authPayload } : {}),
           },
+          // Live-browser mode travels in scan meta; the runner reads
+          // meta.browserCdpUrl to attach to the user's Chrome.
+          ...(liveBrowser && cdpUrl.trim()
+            ? { meta: { browserCdpUrl: cdpUrl.trim() } }
+            : {}),
           selection: {
             enabled: Object.entries(selector.enabled)
               .filter(([, v]) => v)
@@ -208,6 +239,61 @@ export default function WebScanPage() {
                 ⚠ active submitters will hit every form — including destructive
                 actions like delete/logout/transfer.
               </span>
+            )}
+          </div>
+
+          <div
+            className="rounded-xl p-3 flex flex-col gap-3"
+            style={{
+              background: liveBrowser
+                ? "color-mix(in oklab, var(--md-primary) 8%, transparent)"
+                : "color-mix(in oklab, var(--md-on-surface) 3%, transparent)",
+              border: `1px solid ${liveBrowser ? "color-mix(in oklab, var(--md-primary) 35%, transparent)" : "color-mix(in oklab, var(--md-outline) 50%, transparent)"}`,
+            }}
+          >
+            <Switch
+              checked={liveBrowser}
+              onChange={(v) => { setLiveBrowser(v); setCdpTest(null); }}
+              label="Live browser (use my real Chrome)"
+              hint="Attach to a Chrome you launched with --remote-debugging-port so the crawl rides your logged-in session and dodges CAPTCHA / bot walls."
+            />
+            {liveBrowser && (
+              <div className="flex flex-col gap-2">
+                <TextField
+                  label="Chrome DevTools endpoint"
+                  placeholder="http://127.0.0.1:9222"
+                  value={cdpUrl}
+                  onChange={(e) => { setCdpUrl(e.target.value); setCdpTest(null); }}
+                  hint="Launch: chrome --remote-debugging-port=9222 --user-data-dir=… then log in to the target. See docs/live-browser.md."
+                  autoComplete="off"
+                />
+                <div className="flex flex-wrap gap-2 items-center">
+                  <Button
+                    type="button"
+                    variant="outlined"
+                    size="sm"
+                    disabled={!cdpUrl.trim() || (cdpTest !== null && "testing" in cdpTest)}
+                    onClick={() => void testCdp()}
+                  >
+                    {cdpTest !== null && "testing" in cdpTest ? "Testing…" : "Test connection"}
+                  </Button>
+                  {cdpTest !== null && "ok" in cdpTest && cdpTest.ok && (
+                    <span className="md-body-s" style={{ color: "var(--md-primary)" }}>
+                      ✓ Attached — {cdpTest.cookieCount ?? 0} cookie(s)
+                      {typeof cdpTest.targetCookies === "number" ? `, ${cdpTest.targetCookies} for this target` : ""}
+                      {cdpTest.userAgent ? ` · ${cdpTest.userAgent.slice(0, 42)}…` : ""}
+                    </span>
+                  )}
+                  {cdpTest !== null && "ok" in cdpTest && !cdpTest.ok && (
+                    <span className="md-body-s" style={{ color: "var(--md-error)" }}>✗ {cdpTest.error}</span>
+                  )}
+                </div>
+                {cdpTest !== null && "ok" in cdpTest && cdpTest.ok && (cdpTest.targetCookies ?? 0) === 0 && (
+                  <span className="md-body-s text-[color:var(--md-on-surface-variant)]">
+                    Connected, but no cookies for this target yet — open the target in that Chrome window and log in first.
+                  </span>
+                )}
+              </div>
             )}
           </div>
 

@@ -21,6 +21,7 @@
  */
 
 import type { SiteMapForm } from "../web/sitemap";
+import { isProbeableUrl } from "../web/url-hygiene";
 
 export type HttpMethod =
   | "GET"
@@ -214,6 +215,12 @@ export function createDiscoveryBus(opts: BusOptions = {}): DiscoveryBus {
       overflowDropped += 1;
       return false;
     }
+    // Hygiene gate: never let a synthetic / pattern URL (robots glob, templated
+    // `/api/${id}`) enter the bus — downstream consumers would fetch it and the
+    // unstable response would fuel false positives. Forms are validated on their
+    // action URL.
+    const itemUrl = item.kind === "form" ? item.form.action : item.url;
+    if (!isProbeableUrl(itemUrl)) return false;
     const canon = canonicalKey(item);
     if (seen.has(canon)) return false;
     seen.add(canon);

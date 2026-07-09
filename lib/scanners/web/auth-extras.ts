@@ -16,6 +16,21 @@ import { safeUrl, truncate } from "../common";
 import { loadSiteMap } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
 
+/**
+ * Affirmative login-success check. A bare `redirectChain.length > 0` is NOT
+ * success — a FAILED default-cred login commonly 302s back to `/login`, which
+ * would make session-fixation / logout-invalidation fire on every login form.
+ * Require a positive marker or a redirect to a NON-login destination, and bail
+ * if the body carries a failure marker.
+ */
+function looksAuthenticated(r: { body: string; redirectChain: string[] }): boolean {
+  const body = r.body ?? "";
+  if (/invalid|incorrect|wrong\s*password|try again|denied|failed|not\s*found/i.test(body)) return false;
+  if (/logout|sign\s*out|dashboard|welcome\s+[a-z0-9]|my\s*account|profile/i.test(body)) return true;
+  const dest = r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : "";
+  return !!dest && !/login|signin|sign-in|auth|error|denied|unauthor/i.test(dest);
+}
+
 // ─────────────────────────── JWT secret crack ──────────────────────────
 // Curated weak-secrets list — the ones that catch real-world misuse. Adding
 // a 100k rockyou is left to a separate CLI adapter (out of scope here).
@@ -153,9 +168,9 @@ export const sessionFixationScanner: Scanner = {
         try { r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: body.toString(), signal: ctx.signal }); }
         catch { continue; }
 
-        // Login probably succeeded if redirected + (different) cookie set.
-        const loggedIn = r.redirectChain.length > 0 || /logout|sign\s*out|dashboard|welcome/i.test(r.body);
-        if (!loggedIn) continue;
+        // Only assess rotation when login AFFIRMATIVELY succeeded — otherwise a
+        // failed admin:admin that 302s back to /login would read as fixation.
+        if (!looksAuthenticated(r)) continue;
 
         const postValue = session.cookies()[sessionKey];
         if (postValue && postValue === preValue) {
@@ -209,8 +224,7 @@ export const logoutInvalidationScanner: Scanner = {
       try { r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: body.toString(), signal: ctx.signal }); }
       catch { continue; }
 
-      const loggedIn = r.redirectChain.length > 0 || /logout|sign\s*out|dashboard|welcome/i.test(r.body);
-      if (!loggedIn) continue;
+      if (!looksAuthenticated(r)) continue;
 
       // Find a protected page (heuristic: /dashboard, /account, /profile, /admin).
       const protectedPath = ["/dashboard", "/account", "/profile", "/admin", "/me"]
@@ -300,9 +314,15 @@ export const oauthRedirectScanner: Scanner = {
         let r;
         try { r = await session.fetch(probe.toString(), { signal: ctx.signal }); } catch { continue; }
         const loc = r.res.headers.get("location") ?? "";
-        const accepted =
-          (r.res.status >= 200 && r.res.status < 400 && !/invalid|not allowed|denied/i.test(r.body)) ||
-          (loc && new URL(loc, probe).hostname.includes(evilHost));
+        // The ONLY trustworthy bypass signal is the server actually redirecting
+        // to the attacker host. "2xx/3xx and the body doesn't say 'invalid'" is
+        // not evidence of acceptance — a safe server that ignores the tampered
+        // value returns exactly that. So we require the Location to resolve to
+        // evilHost.
+        let accepted = false;
+        if (loc) {
+          try { accepted = new URL(loc, probe).hostname.includes(evilHost); } catch { accepted = false; }
+        }
         if (accepted) {
           await ctx.emit(draft({
             severity: "high", confidence: "medium",

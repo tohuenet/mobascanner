@@ -83,20 +83,11 @@ export function buildProbes(canary: string): Probe[] {
             }
           : null,
     },
-    {
-      rule: "sqli/time",
-      payload: "1' AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--",
-      detect: (r) =>
-        r.latencyMs >= 4500
-          ? {
-              reason: `response delayed ${Math.round(r.latencyMs)}ms after sleep payload`,
-              severity: "critical",
-              cwe: ["CWE-89"],
-              owasp: ["A03:2021"],
-              remediation: "Use parameterized queries / prepared statements.",
-            }
-          : null,
-    },
+    // NOTE: no single-shot time-based SQLi probe here. Latency ≥ a fixed
+    // threshold on ONE request is fundamentally flood-prone — a CDN cold-cache
+    // miss, serverless cold start, GC pause, or WAF tarpit all delay ≥5s and
+    // would emit a critical. Time-based SQLi lives in the dedicated `web.sqli`
+    // scanner, which baselines the latency and re-confirms before emitting.
     {
       rule: "lfi/traversal",
       payload: "../../../../etc/passwd",

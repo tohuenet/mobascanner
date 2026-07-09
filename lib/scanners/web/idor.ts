@@ -148,6 +148,27 @@ export const idorScanner: Scanner = {
       done += 1;
       if (baseline.res.status >= 400) continue; // can't compare
 
+      // Self-baseline: fetch the SAME url again. If it already differs from
+      // itself in the unique-middle (a per-request CSRF token / nonce /
+      // timestamp in the body), then EVERY id — even a non-existent one — will
+      // look "distinct" and the signal is worthless. Skip this candidate.
+      let baseline2; try { baseline2 = await session.fetch(c.url.toString(), { signal: ctx.signal }); }
+      catch { continue; }
+      if (distinctContent(baseline.body, baseline2.body).distinct) {
+        await ctx.log("info", `${c.url}: response varies between identical requests — skipping IDOR (non-deterministic body)`);
+        continue;
+      }
+
+      // Garbage-id control: a wildly out-of-range id that should NOT exist. If
+      // it ALSO returns distinct 2xx content, the endpoint serves content for
+      // ANY id (a public listing / echo), which is not owner-scoped access.
+      const controlUrl = buildVariant(c, 10_000_000);
+      let control; try { control = await session.fetch(controlUrl.toString(), { signal: ctx.signal }); } catch { control = null; }
+      if (control && control.res.status >= 200 && control.res.status < 300 && distinctContent(baseline.body, control.body).distinct) {
+        await ctx.log("info", `${c.url}: a bogus id also returns distinct content — endpoint echoes arbitrary ids, not IDOR`);
+        continue;
+      }
+
       const variants: { offset: number; status: number; body: string; distinct: boolean; uniqueLen: number }[] = [];
       for (const off of offsets) {
         if (ctx.signal.aborted) break;

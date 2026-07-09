@@ -50,6 +50,76 @@ async function gatherFromSeed(seed: URL, ctx: { signal: AbortSignal; target: { a
   return session.observedSetCookies.map((s) => ({ url: s.url, raw: s.raw, isHttps: s.url.startsWith("https://") }));
 }
 
+export interface CookieIssue {
+  key: string;
+  sev: "high" | "medium" | "low" | "info";
+  rule: string;
+  title: string;
+  description: string;
+  cwe?: string[];
+  owasp?: string[];
+  remediation?: string;
+}
+
+/**
+ * Pure per-cookie assessment. `raw` MUST be a real `Set-Cookie` response header
+ * (attributes intact) — never a name=value jar entry, or every flag reads as
+ * missing. Returns zero or more issues; the caller de-dupes across cookies.
+ */
+export function assessCookie(raw: string, isHttps: boolean): CookieIssue[] {
+  const c = parseSetCookie(raw);
+  if (!c) return [];
+  const isSession = SESSION_HINT.test(c.name);
+  const out: CookieIssue[] = [];
+
+  if (isHttps && !c.secure) {
+    out.push({
+      key: `${c.name}/secure`, sev: isSession ? "high" : "medium", rule: "cookies/secure",
+      title: `Cookie "${c.name}" missing Secure flag`,
+      description: "Cookie sent over HTTPS but lacks the Secure flag — browsers will also send it over HTTP after a downgrade.",
+      cwe: ["CWE-614"], owasp: ["A02:2021"], remediation: "Add `Secure` to the cookie attributes.",
+    });
+  }
+  if (isSession && !c.httpOnly) {
+    out.push({
+      key: `${c.name}/httponly`, sev: "high", rule: "cookies/httponly",
+      title: `Session-like cookie "${c.name}" missing HttpOnly`,
+      description: "Cookie name suggests a session/auth token but it is JS-readable, exposing it to XSS.",
+      cwe: ["CWE-1004"], owasp: ["A07:2021"], remediation: "Add `HttpOnly` to session/auth cookies.",
+    });
+  }
+  if (!c.sameSite) {
+    out.push({
+      key: `${c.name}/samesite`, sev: isSession ? "medium" : "low", rule: "cookies/samesite",
+      title: `Cookie "${c.name}" missing SameSite`,
+      description: "Without SameSite, the browser uses Lax in modern UAs but old browsers still allow CSRF on state-changing requests.",
+      cwe: ["CWE-352"], remediation: "Add `SameSite=Lax` (or `Strict` for session cookies).",
+    });
+  } else if (c.sameSite.toLowerCase() === "none" && !c.secure) {
+    out.push({
+      key: `${c.name}/samesite-none-insecure`, sev: "high", rule: "cookies/samesite-none-insecure",
+      title: `Cookie "${c.name}" uses SameSite=None without Secure`,
+      description: "Browsers reject SameSite=None cookies that aren't also Secure.",
+      cwe: ["CWE-614"], remediation: "Set `Secure` whenever using `SameSite=None`.",
+    });
+  }
+  if (c.maxAge && c.maxAge > 60 * 60 * 24 * 365) {
+    out.push({
+      key: `${c.name}/long-lived`, sev: "low", rule: "cookies/long-lived",
+      title: `Cookie "${c.name}" has Max-Age > 1 year`,
+      description: "Long-lived cookies expand the replay window if leaked.",
+    });
+  }
+  if (c.domain && c.domain.startsWith(".")) {
+    out.push({
+      key: `${c.name}/apex`, sev: "info", rule: "cookies/apex-domain",
+      title: `Cookie "${c.name}" scoped to apex domain "${c.domain}"`,
+      description: "Apex-domain cookies are sent to every subdomain, including untrusted ones.",
+    });
+  }
+  return out;
+}
+
 export const cookiesScanner: Scanner = {
   id: "web.cookies",
   name: "Cookie Analyzer (per-URL)",
@@ -68,24 +138,28 @@ export const cookiesScanner: Scanner = {
     const seed = safeUrl(ctx.target.value);
     if (!seed) { await ctx.log("error", "invalid URL"); return; }
 
-    let cookies: SeenCookie[] = [];
+    // Cookie attributes (Secure / HttpOnly / SameSite) exist ONLY on the raw
+    // Set-Cookie response header. Gather those from the live seed fetch and
+    // from the per-page Set-Cookie headers the crawler recorded. We deliberately
+    // do NOT fall back to `map.cookies` — that is a name→value jar with the
+    // attributes already stripped, and judging flags from it fabricates
+    // "missing Secure/HttpOnly" findings for cookies whose headers were never
+    // parsed (the exact bug that flagged HttpOnly-by-default session cookies).
+    const cookies: SeenCookie[] = await gatherFromSeed(seed, ctx);
     const map = await loadSiteMap(ctx.scanId);
     if (map) {
-      // Reconstruct from SiteMap — the crawler doesn't currently persist
-      // setCookies per page (we'd grow the JSON a lot), so we re-issue HEAD
-      // requests against pages flagged as setting cookies, plus the seed.
-      // For a tighter loop we still hit the seed and let BrowsingSession capture.
-      cookies = await gatherFromSeed(seed, ctx);
-      // Also include any cookies the crawler captured at scan-end into map.cookies
-      // (we synthesize a Set-Cookie line for each).
-      for (const [name, value] of Object.entries(map.cookies)) {
-        if (cookies.some((c) => c.raw.startsWith(name + "="))) continue;
-        cookies.push({ url: map.origin, raw: `${name}=${value}`, isHttps: map.origin.startsWith("https://") });
+      const seenRaw = new Set(cookies.map((c) => c.raw));
+      for (const p of map.pages) {
+        if (!p.setCookies?.length) continue;
+        const isHttps = (p.finalUrl ?? p.url).startsWith("https://");
+        for (const raw of p.setCookies) {
+          if (seenRaw.has(raw)) continue;
+          seenRaw.add(raw);
+          cookies.push({ url: p.finalUrl ?? p.url, raw, isHttps });
+        }
       }
-    } else {
-      cookies = await gatherFromSeed(seed, ctx);
     }
-    if (!cookies.length) { await ctx.progress(1, "no cookies set"); return; }
+    if (!cookies.length) { await ctx.progress(1, "no observed Set-Cookie headers"); return; }
 
     // Dedupe by cookie name + issue
     const issues = new Map<string, { sev: "high" | "medium" | "low" | "info"; rule: string; title: string; description: string; cwe?: string[]; owasp?: string[]; remediation?: string; sample: { url: string; raw: string }[] }>();
@@ -95,59 +169,9 @@ export const cookiesScanner: Scanner = {
     };
 
     for (const seen of cookies) {
-      const c = parseSetCookie(seen.raw);
-      if (!c) continue;
-      const isSession = SESSION_HINT.test(c.name);
-
-      if (seen.isHttps && !c.secure) {
-        push(`${c.name}/secure`, {
-          sev: isSession ? "high" : "medium",
-          rule: "cookies/secure",
-          title: `Cookie "${c.name}" missing Secure flag`,
-          description: "Cookie sent over HTTPS but lacks the Secure flag — browsers will also send it over HTTP after a downgrade.",
-          cwe: ["CWE-614"], owasp: ["A02:2021"],
-          remediation: "Add `Secure` to the cookie attributes.",
-        }, { url: seen.url, raw: seen.raw });
-      }
-      if (isSession && !c.httpOnly) {
-        push(`${c.name}/httponly`, {
-          sev: "high", rule: "cookies/httponly",
-          title: `Session-like cookie "${c.name}" missing HttpOnly`,
-          description: "Cookie name suggests a session/auth token but it is JS-readable, exposing it to XSS.",
-          cwe: ["CWE-1004"], owasp: ["A07:2021"],
-          remediation: "Add `HttpOnly` to session/auth cookies.",
-        }, { url: seen.url, raw: seen.raw });
-      }
-      if (!c.sameSite) {
-        push(`${c.name}/samesite`, {
-          sev: isSession ? "medium" : "low", rule: "cookies/samesite",
-          title: `Cookie "${c.name}" missing SameSite`,
-          description: "Without SameSite, the browser uses Lax in modern UAs but old browsers still allow CSRF on state-changing requests.",
-          cwe: ["CWE-352"],
-          remediation: "Add `SameSite=Lax` (or `Strict` for session cookies).",
-        }, { url: seen.url, raw: seen.raw });
-      } else if (c.sameSite.toLowerCase() === "none" && !c.secure) {
-        push(`${c.name}/samesite-none-insecure`, {
-          sev: "high", rule: "cookies/samesite-none-insecure",
-          title: `Cookie "${c.name}" uses SameSite=None without Secure`,
-          description: "Browsers reject SameSite=None cookies that aren't also Secure.",
-          cwe: ["CWE-614"],
-          remediation: "Set `Secure` whenever using `SameSite=None`.",
-        }, { url: seen.url, raw: seen.raw });
-      }
-      if (c.maxAge && c.maxAge > 60 * 60 * 24 * 365) {
-        push(`${c.name}/long-lived`, {
-          sev: "low", rule: "cookies/long-lived",
-          title: `Cookie "${c.name}" has Max-Age > 1 year`,
-          description: "Long-lived cookies expand the replay window if leaked.",
-        }, { url: seen.url, raw: seen.raw });
-      }
-      if (c.domain && c.domain.startsWith(".")) {
-        push(`${c.name}/apex`, {
-          sev: "info", rule: "cookies/apex-domain",
-          title: `Cookie "${c.name}" scoped to apex domain "${c.domain}"`,
-          description: "Apex-domain cookies are sent to every subdomain, including untrusted ones.",
-        }, { url: seen.url, raw: seen.raw });
+      for (const iss of assessCookie(seen.raw, seen.isHttps)) {
+        const { key, ...rest } = iss;
+        push(key, rest, { url: seen.url, raw: seen.raw });
       }
     }
 

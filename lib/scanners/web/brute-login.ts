@@ -18,6 +18,7 @@ import { draft, type Scanner } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
 import { loadSiteMap, type SiteMapForm } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
+import { stableRedirect } from "./_oracle";
 
 const DEFAULT_CREDS: { user: string; pass: string }[] = [
   { user: "admin", pass: "admin" },
@@ -49,6 +50,35 @@ const DEFAULT_CREDS: { user: string; pass: string }[] = [
 
 const FAILURE_MARKERS = /invalid|incorrect|wrong|try again|denied|failure|failed login|bad credentials|sai mật|sai tài|không đúng/i;
 const SUCCESS_MARKERS = /logout|sign\s*out|dashboard|welcome\s*[a-z0-9]|profile/i;
+
+// Cookie names that actually indicate an authenticated session — as opposed to
+// tracking / device-id cookies (did, _ga, ssuuid, *_ubtc) which are set on
+// failed attempts too and must NOT be read as "login worked".
+const AUTH_COOKIE_HINT = /(sess|sid|auth|token|jwt|login|remember|logged|_session)/i;
+
+// Hosts / flows that run a federated (OIDC / SAML) login. There, the visible
+// <form> POST is not the real credential exchange — the SPA drives it via XHR
+// with rotating `state`/`nonce`, and a form POST returns a 4xx/redirect that
+// says nothing about credential validity. Testing default creds here only
+// yields false positives, so we skip and say why.
+const IDP_HOST = /(^|\.)(auth0\.com|okta\.com|oktapreview\.com|onelogin\.com|pingidentity\.com|microsoftonline\.com|accounts\.google\.com|amazoncognito\.com)$/i;
+
+function looksLikeFederatedLogin(actionUrl: string): boolean {
+  try {
+    const u = new URL(actionUrl);
+    if (IDP_HOST.test(u.hostname)) return true;
+    if (/^(auth|login|sso|accounts|id)\./i.test(u.hostname)) return true;
+    if (/\/(authorize|oauth2?|u\/login|as\/authorization|realms\/|saml)/i.test(u.pathname)) return true;
+    // OIDC authorize-style query fingerprint.
+    if (u.searchParams.has("state") &&
+        (u.searchParams.has("client_id") || u.searchParams.has("redirect_uri") || u.searchParams.has("ui_locales"))) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 function findUserPassFields(form: SiteMapForm): { user: string; pass: string } | null {
   const pass = form.inputs.find((i) => i.type === "password");
@@ -97,16 +127,29 @@ export const bruteLoginScanner: Scanner = {
       const fields = findUserPassFields(form);
       if (!fields) continue;
 
-      // Establish a baseline failure response.
+      // Skip federated (OIDC/SAML) logins — the form POST is not the real
+      // credential check, so any "success" here is a false positive.
+      if (looksLikeFederatedLogin(form.action)) {
+        await ctx.log("info", `${form.action}: federated/OIDC login — form POST is not the credential exchange, skipping default-cred test`);
+        continue;
+      }
+
+      // Establish a baseline FAILURE response: wrong creds. We record its
+      // status, body length, AND the cookies it sets, so tracking/device
+      // cookies that appear on every request don't later read as "logged in".
       const baselineSession = new BrowsingSession(seed.origin, ctx.target.auth?.headers ?? {});
       const baselineBody = new URLSearchParams();
       for (const i of form.inputs) baselineBody.set(i.name, i.value || "moba-baseline");
       baselineBody.set(fields.user, "this_user_does_not_exist_moba");
       baselineBody.set(fields.pass, "wrong_password_xxxxx");
       let baselineLen = 0; let baselineStatus = 0;
+      let baselineRedirect: string | null = null;
+      const baselineCookieNames = new Set<string>();
       try {
         const r = await baselineSession.fetch(form.action, { method: "POST", body: baselineBody.toString(), headers: { "content-type": "application/x-www-form-urlencoded" }, signal: ctx.signal });
         baselineLen = r.body.length; baselineStatus = r.res.status;
+        baselineRedirect = stableRedirect(r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : null);
+        for (const c of baselineSession.observedSetCookies) baselineCookieNames.add(c.raw.split("=")[0].trim());
       } catch { /* tolerate */ }
 
       for (const cred of DEFAULT_CREDS) {
@@ -126,34 +169,51 @@ export const bruteLoginScanner: Scanner = {
         try { r = await session.fetch(form.action, { method: "POST", body: body.toString(), headers: { "content-type": "application/x-www-form-urlencoded" }, signal: ctx.signal }); }
         catch { continue; }
 
-        const looksRedirected = r.redirectChain.length > 0 && r.res.status < 400;
-        const cookiesSet = session.observedSetCookies.length > 0;
-        const lenDelta = Math.abs(r.body.length - baselineLen);
-        const statusChanged = r.res.status !== baselineStatus;
-        const failureMarker = FAILURE_MARKERS.test(r.body);
-        const successMarker = SUCCESS_MARKERS.test(r.body);
+        const respBody = r.body;
+        const failureMarker = FAILURE_MARKERS.test(respBody);
+        const successMarker = SUCCESS_MARKERS.test(respBody);
+        const setCookieNames = session.observedSetCookies.map((c) => c.raw.split("=")[0].trim());
+        // A genuinely NEW session/auth cookie that the failed baseline did not
+        // set — tracking/device cookies present on the baseline don't count.
+        const newAuthCookie = setCookieNames.find((n) => AUTH_COOKIE_HINT.test(n) && !baselineCookieNames.has(n)) ?? null;
+        const finalRedirect = stableRedirect(r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : null);
+        const redirectedToApp =
+          !!finalRedirect && finalRedirect !== baselineRedirect &&
+          !/login|signin|sign-in|error|denied|unauthorized/i.test(finalRedirect);
+        const bigBodyDelta = Math.abs(respBody.length - baselineLen) > Math.max(100, baselineLen * 0.05);
 
-        // Heuristic: success if we got redirected somewhere AND set a cookie,
-        // OR if response body looks logged-in AND no failure marker.
-        const success =
-          (looksRedirected && cookiesSet) ||
-          (successMarker && !failureMarker) ||
-          (cookiesSet && statusChanged && lenDelta > 100 && !failureMarker);
+        // AFFIRMATIVE success oracle. A 4xx/5xx status, an empty body, or the
+        // mere absence of a failure marker are NOT success (the old heuristic
+        // fired on a 406 + empty body + tracking cookies). Require a positive
+        // signal that separates this response from the wrong-password baseline.
+        const positive =
+          !!newAuthCookie ||
+          (redirectedToApp && successMarker) ||
+          (successMarker && bigBodyDelta);
+        const success = r.res.status < 400 && respBody.length > 0 && !failureMarker && positive;
 
         if (success) {
+          const why = newAuthCookie
+            ? `set a new session cookie "${newAuthCookie}" absent from failed attempts`
+            : redirectedToApp
+              ? `redirected to a post-login destination (${finalRedirect})`
+              : "returned an authenticated-looking page distinct from the failure baseline";
           await ctx.emit(draft({
             severity: "critical", confidence: "medium",
             title: `Default credentials accepted: ${cred.user}:${cred.pass || "(empty)"} on ${form.action}`,
-            description: "A login form accepted a well-known default credential pair. This is the single most common cause of trivial compromise.",
+            description: `A login form accepted a well-known default credential pair — it ${why}. Default credentials are the single most common cause of trivial compromise.`,
             ruleId: "brute-login/default-creds",
             cwe: ["CWE-521", "CWE-798"],
             owasp: ["A07:2021"],
             location: { url: form.action, snippet: `${fields.user}=${cred.user}&${fields.pass}=...` },
             evidence: {
               status: r.res.status,
+              positiveSignal: why,
               redirectChain: r.redirectChain,
-              cookieNames: session.observedSetCookies.map((c) => c.raw.split("=")[0]),
-              bodySnippet: truncate(r.body, 300),
+              newAuthCookie,
+              cookieNames: setCookieNames,
+              baselineStatus, baselineLen, baselineRedirect,
+              bodySnippet: truncate(respBody, 300),
             },
             remediation: "Force a password reset for this account immediately. Disable default credentials in deployment automation. Add account-lockout / rate-limiting on the login endpoint.",
             references: ["https://owasp.org/Top10/A07_2021-Identification_and_Authentication_Failures/"],

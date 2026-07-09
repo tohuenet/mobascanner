@@ -91,10 +91,9 @@ const SQL_ERROR_PROBE: Probe = {
   detect: (r) => SQL_ERROR_RE.test(r.body) ? { rule: "sqli/error", severity: "critical", reason: "DB engine error string in response", cwe: ["CWE-89"], owasp: ["A03:2021"], remediation: "Use parameterized queries / prepared statements. Never concatenate user input into SQL." } : null,
 };
 
-const SQL_TIME_PROBE: Probe = {
-  payload: "1' AND (SELECT 1 FROM (SELECT(SLEEP(5)))a)--",
-  detect: (r) => r.latencyMs >= 4500 ? { rule: "sqli/time", severity: "critical", reason: `response delayed ${Math.round(r.latencyMs)}ms after sleep payload`, cwe: ["CWE-89"], owasp: ["A03:2021"], remediation: "Use parameterized queries / prepared statements." } : null,
-};
+// No single-shot time-based SQLi probe: latency ≥ a fixed threshold on ONE
+// request floods on CDN cold starts / GC / WAF tarpits. Time-based SQLi lives
+// in `web.sqli`, which baselines latency and re-confirms.
 
 const LFI_PROBE: Probe = {
   payload: "../../../../etc/passwd",
@@ -212,7 +211,7 @@ export const activeInjectionScanner: Scanner = {
 
     const canary = "MOBA" + randomBytes(4).toString("hex");
     const oobHost = `oob-${canary.toLowerCase()}.invalid`;
-    const probes: Probe[] = [REFLECT_PROBE(canary), SQL_ERROR_PROBE, SQL_TIME_PROBE, LFI_PROBE, CMD_PROBE, SSRF_PROBE, OPEN_REDIRECT_PROBE(oobHost)];
+    const probes: Probe[] = [REFLECT_PROBE(canary), SQL_ERROR_PROBE, LFI_PROBE, CMD_PROBE, SSRF_PROBE, OPEN_REDIRECT_PROBE(oobHost)];
 
     const headers: HeadersInit = {
       "User-Agent": "moba-scanner/0.1 (+active)",
@@ -238,7 +237,7 @@ export const activeInjectionScanner: Scanner = {
           if (!hit) continue;
           await ctx.emit(draft({
             severity: hit.severity,
-            confidence: probe === SQL_TIME_PROBE ? "medium" : "high",
+            confidence: "high",
             title: `${hit.rule.toUpperCase()} on parameter "${param}"`,
             description: `${probe.payload.slice(0, 80)}\n\n→ ${hit.reason}`,
             ruleId: hit.rule,

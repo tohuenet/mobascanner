@@ -25,9 +25,13 @@ import {
 } from "../store";
 import { detectChains } from "../triage/chains";
 import { dedupFindings } from "./dedup";
+import { auditFindings } from "./plausibility";
 import { startWebhookListener } from "../notifications/webhooks";
 import { startScannerCost, endScannerCost } from "./cost-tracker";
 import { startTrafficCapture, endTrafficCapture } from "../web/traffic-capture";
+import { liveBrowserEndpoint, setActiveCdpEndpoint } from "../web/browser";
+import { captureLiveSession } from "../web/live-session";
+import { setLiveSession, clearLiveSession } from "../web/session-defaults";
 import { startTemplateUpdater } from "../schedule/template-updater";
 import { createDiscoveryBus, type DiscoveredItem } from "./discovery";
 import type { ScanContext, Scanner } from "./scanner";
@@ -61,6 +65,34 @@ export async function runScan(scanId: string): Promise<void> {
   await updateScan(scan);
   startTrafficCapture(scanId);
   scanBus.emitEvent({ kind: "scan-started", scanId, at: Date.now() });
+
+  // Live-browser mode: if configured, borrow the user's real Chrome session so
+  // every fetch-based scanner sends the logged-in cookies + real User-Agent and
+  // stops tripping bot-detection / CAPTCHA walls. Best-effort; on any failure
+  // we log a hint and fall back to the default anonymous crawler.
+  let liveOrigin: string | null = null;
+  if (scan.kind === "web") {
+    const cdpUrl = liveBrowserEndpoint(scan.meta);
+    if (cdpUrl) {
+      // Publish the endpoint so the browser scanners (spa-crawler / dom-xss),
+      // which don't receive scan.meta, attach to the same Chrome.
+      setActiveCdpEndpoint(cdpUrl);
+      try {
+        const origin = new URL(scan.target.value).origin;
+        const live = await captureLiveSession(scan.target.value, cdpUrl);
+        if (live && (live.cookieHeader || live.userAgent)) {
+          setLiveSession(origin, live);
+          liveOrigin = origin;
+          const cookieN = live.cookieHeader ? live.cookieHeader.split(";").filter(Boolean).length : 0;
+          await appendLog(scanId, "info", `[live-browser] attached to ${cdpUrl} — reusing ${cookieN} cookie(s)${live.userAgent ? " + real User-Agent" : ""} for ${origin}`);
+        } else {
+          await appendLog(scanId, "warn", `[live-browser] attached to ${cdpUrl} but captured no session for ${scan.target.value} — is that tab logged in? Falling back to anonymous crawl.`);
+        }
+      } catch (e) {
+        await appendLog(scanId, "warn", `[live-browser] could not attach to ${cdpUrl} (${e instanceof Error ? e.message : e}). Launch Chrome with --remote-debugging-port and check MOBA_BROWSER_CDP_URL. Falling back to anonymous crawl.`);
+      }
+    }
+  }
 
   const enabled = scan.selection.enabled
     .map((id) => getScanner(id))
@@ -284,6 +316,21 @@ export async function runScan(scanId: string): Promise<void> {
       }
     }
 
+    // Plausibility self-audit — non-destructive. Warn (in the scan log) if any
+    // scanner produced an implausible burst of high/critical findings, so a
+    // false-positive regression is visible rather than silently trusted.
+    if (!controller.signal.aborted) {
+      try {
+        const all = await listFindings(scanId);
+        for (const w of auditFindings(all)) {
+          await appendLog(scanId, "warn", `[plausibility] ${w.message}`);
+          scanBus.emitEvent({ kind: "log", scanId, level: "warn", message: `[plausibility] ${w.message}`, at: Date.now() });
+        }
+      } catch (e) {
+        await appendLog(scanId, "warn", `[plausibility] ${e instanceof Error ? e.message : e}`);
+      }
+    }
+
     scan.status = controller.signal.aborted ? "cancelled" : "completed";
     scan.finishedAt = Date.now();
     await updateScan(scan);
@@ -297,6 +344,8 @@ export async function runScan(scanId: string): Promise<void> {
     scanBus.emitEvent({ kind: "scan-failed", scanId, error: message, at: Date.now() });
   } finally {
     endTrafficCapture();
+    if (liveOrigin) clearLiveSession(liveOrigin);
+    setActiveCdpEndpoint(null);
     activeRuns.delete(scanId);
   }
 }

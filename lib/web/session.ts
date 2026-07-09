@@ -9,6 +9,7 @@
 import { rateLimitFor } from "./rate-limiter";
 import { recordHttp } from "../engine/cost-tracker";
 import { captureEntry } from "./traffic-capture";
+import { getLiveSession } from "./session-defaults";
 
 interface ParsedCookie {
   name: string;
@@ -54,7 +55,34 @@ export class BrowsingSession {
 
   constructor(origin: string, extraHeaders: Record<string, string> = {}) {
     this.origin = origin;
-    this.extraHeaders = extraHeaders;
+    // Live-browser mode: inherit the user's real Chrome session for this origin
+    // — real User-Agent + spoofed client-hint headers, and seed the cookie jar
+    // with the authenticated cookies so we don't look like an anonymous bot.
+    // Caller-supplied extraHeaders win (explicit auth overrides).
+    const live = getLiveSession(origin);
+    if (live) {
+      const liveHeaders: Record<string, string> = { ...(live.headers ?? {}) };
+      if (live.userAgent) liveHeaders["User-Agent"] = live.userAgent;
+      this.extraHeaders = { ...liveHeaders, ...extraHeaders };
+      if (live.cookieHeader) this.seedCookies(live.cookieHeader);
+    } else {
+      this.extraHeaders = extraHeaders;
+    }
+  }
+
+  /** Pre-populate the cookie jar from a `name=value; …` header string, so
+   *  authenticated cookies persist across the whole crawl (a plain Cookie
+   *  request header would get clobbered by the jar on the first response). */
+  seedCookies(cookieHeader: string): void {
+    for (const pair of cookieHeader.split(";")) {
+      const s = pair.trim();
+      if (!s) continue;
+      const eq = s.indexOf("=");
+      if (eq < 0) continue;
+      const name = s.slice(0, eq).trim();
+      const value = s.slice(eq + 1).trim();
+      if (name) this.jar.set(name, { name, value });
+    }
   }
 
   cookieHeader(): string {

@@ -88,16 +88,25 @@ export const verbTamperingScanner: Scanner = {
             location: { url: page.url, snippet: "PUT / HTTP/1.1" },
           }));
         }
-        if (r.res.status >= 200 && r.res.status < 300 && page.status >= 400) {
+        // A 2xx on an alternative method is a bypass only if it actually
+        // RETURNED THE PROTECTED CONTENT. HEAD (no body by spec) and OPTIONS
+        // (CORS preflight → 200/204 + `Allow:` + empty body, auth-independent)
+        // answer 2xx on every gated path and produced a flood of FPs. Exclude
+        // them, and require a non-empty body that isn't itself a login/deny page.
+        const contentBearing =
+          method !== "HEAD" && method !== "OPTIONS" &&
+          r.body.length > 0 &&
+          !/login|sign\s*in|denied|forbidden|unauthor|access\s*denied/i.test(r.body);
+        if (r.res.status >= 200 && r.res.status < 300 && page.status >= 400 && contentBearing) {
           await ctx.emit(draft({
             severity: "high", confidence: "medium",
             title: `Verb-tampering bypass: ${method} returns ${r.res.status} where GET returns ${page.status}`,
-            description: "Access-control logic discriminates by HTTP method. The non-GET handler appears to skip the auth check.",
+            description: "Access-control logic discriminates by HTTP method. The non-GET handler returned content while GET is gated — it appears to skip the auth check.",
             ruleId: "verb-tampering/bypass",
             cwe: ["CWE-285"],
             owasp: ["A01:2021"],
             location: { url: page.url, snippet: `original GET → ${page.status}, ${method} → ${r.res.status}` },
-            evidence: { method, originalStatus: page.status, newStatus: r.res.status, snippet: truncate(r.body, 300) },
+            evidence: { method, originalStatus: page.status, newStatus: r.res.status, bodyLen: r.body.length, snippet: truncate(r.body, 300) },
             remediation: "Apply auth checks to ALL methods, or whitelist only the methods needed and reject others (`Allow: GET, POST`).",
           }));
         }
@@ -110,7 +119,8 @@ export const verbTamperingScanner: Scanner = {
         try { r = await session.fetch(page.url, { method: "POST", headers: { [ov.name]: ov.value }, signal: ctx.signal }); }
         catch { done += 1; continue; }
         done += 1;
-        if (r.res.status >= 200 && r.res.status < 300 && page.status >= 400) {
+        const overrideContent = r.body.length > 0 && !/login|sign\s*in|denied|forbidden|unauthor|access\s*denied/i.test(r.body);
+        if (r.res.status >= 200 && r.res.status < 300 && page.status >= 400 && overrideContent) {
           await ctx.emit(draft({
             severity: "high", confidence: "medium",
             title: `Method-override bypass: ${ov.name}: ${ov.value} returns ${r.res.status}`,

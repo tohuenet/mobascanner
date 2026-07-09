@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./test/_register.mjs test/correlation.test.ts test/fingerprint.test.ts test/interaction-safety.test.ts test/ranker.test.ts test/fingerprint-live.integration.test.ts test/spa-interaction.integration.test.ts"
+    "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./test/_register.mjs test/correlation.test.ts test/fingerprint.test.ts test/interaction-safety.test.ts test/ranker.test.ts test/url-hygiene.test.ts test/oracle.test.ts test/cookies.test.ts test/plausibility.test.ts test/discovery-hygiene.test.ts test/live-session.test.ts test/fingerprint-live.integration.test.ts test/spa-interaction.integration.test.ts test/scanner-fp.integration.test.ts"
   },
   "dependencies": {
     "@types/cross-spawn": "^6.0.6",

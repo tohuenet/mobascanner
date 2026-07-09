@@ -23,8 +23,13 @@
 import { randomBytes } from "node:crypto";
 import { draft, type Scanner } from "../../engine/scanner";
 import { safeUrl, truncate } from "../common";
+import { sameSite } from "../../web/url-hygiene";
 import { loadSiteMap } from "../../web/sitemap";
 import { BrowsingSession } from "../../web/session";
+import { isNonSignal, stableRedirect, measureBaseline, exceedsNoise, type ProbeResp } from "./_oracle";
+
+/** Cookie names that mark an authenticated session (vs tracking/device ids). */
+const AUTH_COOKIE_HINT = /(sess|sid|auth|token|jwt|login|remember|logged|_session)/i;
 
 // ───────────────────────────── SSTI ──────────────────────────────
 // Each engine has a unique fingerprint expression. Math chosen so that the
@@ -36,7 +41,9 @@ const SSTI_PROBES: { engine: string; payload: string; expect: RegExp }[] = [
   { engine: "jinja2/twig",  payload: "${7*191}",        expect: /\b1337\b/ },
   { engine: "freemarker",   payload: "${7*191}",        expect: /\b1337\b/ },
   { engine: "velocity",     payload: "#set($x=7*191)$x",expect: /\b1337\b/ },
-  { engine: "handlebars",   payload: "{{#with}}{{lookup this 7}}{{/with}}", expect: /^$/ /* presence-only */ },
+  // NOTE: no "presence-only" (expect empty body) probe — `/^$/` matches a
+  // blocked/empty WAF response and fired a critical on every param. Every probe
+  // now requires the evaluated value `1337` to actually appear.
   // Smarty: `{$var}` with arithmetic.
   { engine: "smarty",       payload: "{math equation=\"7*191\"}",     expect: /\b1337\b/ },
   // ERB / Ruby: <%= 7*191 %>
@@ -73,6 +80,15 @@ export const sstiScanner: Scanner = {
     let done = 0; const total = targets.reduce((a, t) => a + t.params.length * SSTI_PROBES.length, 0);
     for (const { url, params } of targets) {
       for (const p of params) {
+        // Baseline with a benign value: if "1337" already appears on the page
+        // (a port, an id, a view-count, leetspeak) we cannot attribute it to our
+        // arithmetic — skip this param rather than emit a phantom critical.
+        try {
+          const bu = new URL(url.toString());
+          bu.searchParams.set(p, "mobassti");
+          const br = await session.fetch(bu.toString(), { signal: ctx.signal });
+          if (/\b1337\b/.test(br.body)) continue;
+        } catch { /* tolerate — proceed */ }
         for (const probe of SSTI_PROBES) {
           if (ctx.signal.aborted) break;
           const u = new URL(url.toString());
@@ -81,7 +97,7 @@ export const sstiScanner: Scanner = {
           try { r = await session.fetch(u.toString(), { signal: ctx.signal }); } catch { done++; continue; }
           done++;
           if (done % 6 === 0) await ctx.progress(done / Math.max(total, 1), `${probe.engine} on ${p}`);
-          if (probe.expect.test(r.body)) {
+          if (r.body.length > 0 && probe.expect.test(r.body)) {
             await ctx.emit(draft({
               severity: "critical", confidence: "high",
               title: `SSTI (${probe.engine}) on parameter "${p}"`,
@@ -127,45 +143,53 @@ export const nosqlScanner: Scanner = {
     if (!loginForms.length) { await ctx.progress(1, "no login forms"); return; }
     const session = new BrowsingSession(seed.origin, ctx.target.auth?.headers ?? {});
 
-    // Establish a "deny" baseline.
     const baselineBody = { username: "doesnotexist__moba__", password: "wrongpassword" };
-    let baselineLen = 0; let baselineStatus = 0;
+    const asResp = (r: { res: { status: number }; body: string; redirectChain: string[] }): ProbeResp =>
+      ({ status: r.res.status, body: r.body, latencyMs: 0, redirect: r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : null });
 
     for (const form of loginForms) {
+      if (ctx.signal.aborted) break;
+      // Deny baseline (wrong STRING creds) — records the status, redirect, and
+      // the cookies a FAILED login sets, so tracking cookies (present on every
+      // request) can't later read as "bypassed".
+      let baseResp: ProbeResp | null = null;
+      const baselineCookieNames = new Set<string>();
       try {
-        const r = await session.fetch(form.action, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(baselineBody),
-          signal: ctx.signal,
-        });
-        baselineLen = r.body.length; baselineStatus = r.res.status;
+        const rb = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(baselineBody), signal: ctx.signal });
+        baseResp = asResp(rb);
+        for (const c of session.observedSetCookies) baselineCookieNames.add(c.raw.split("=")[0].trim());
       } catch { continue; }
+      const baselineRedirect = stableRedirect(baseResp.redirect);
 
       for (const probe of NOSQL_PROBES) {
         if (ctx.signal.aborted) break;
+        // Fresh session per probe so a NEW auth cookie is attributable.
+        const s = new BrowsingSession(seed.origin, ctx.target.auth?.headers ?? {});
         let r;
         try {
-          r = await session.fetch(form.action, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(probe.body),
-            signal: ctx.signal,
-          });
+          r = await s.fetch(form.action, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(probe.body), signal: ctx.signal });
         } catch { continue; }
-        const cookieSet = session.observedSetCookies.length > 0;
-        const lenDelta = Math.abs(r.body.length - baselineLen);
-        const statusDelta = r.res.status !== baselineStatus;
-        const looksRedirected = r.redirectChain.length > 0 && r.res.status < 400;
-        if ((looksRedirected && cookieSet) || (statusDelta && lenDelta > 100 && !/invalid|denied|incorrect/i.test(r.body))) {
+        const resp = asResp(r);
+        if (isNonSignal(resp, baseResp.status)) continue; // blocked/empty ≠ bypass
+        const failureMarker = /invalid|denied|incorrect|wrong|not\s*found/i.test(r.body);
+        const successMarker = /logout|sign\s*out|dashboard|welcome\s+[a-z0-9]|"success"\s*:\s*true/i.test(r.body);
+        const newAuthCookie = s.observedSetCookies
+          .map((c) => c.raw.split("=")[0].trim())
+          .find((n) => AUTH_COOKIE_HINT.test(n) && !baselineCookieNames.has(n)) ?? null;
+        const redirect = stableRedirect(resp.redirect);
+        const redirectedToApp = !!redirect && redirect !== baselineRedirect && !/login|signin|sign-in|error|denied|unauthor/i.test(redirect);
+        // AFFIRMATIVE: the typed-operator request produced an authenticated
+        // outcome the string-cred deny baseline did not.
+        const positive = !!newAuthCookie || (redirectedToApp && successMarker) || (successMarker && !failureMarker);
+        if (resp.status < 400 && !failureMarker && positive) {
           await ctx.emit(draft({
             severity: "critical", confidence: "medium",
             title: `NoSQL injection auth bypass: ${probe.label} on ${form.action}`,
-            description: `Sending a JSON object with MongoDB operators (${probe.label}) instead of a string for the login form bypassed auth.`,
+            description: `A JSON object with MongoDB operators (${probe.label}) produced an authenticated outcome (${newAuthCookie ? `new session cookie "${newAuthCookie}"` : redirectedToApp ? `redirect to ${redirect}` : "a logged-in page"}) that the wrong-credentials baseline did not.`,
             ruleId: "nosql/auth-bypass",
             cwe: ["CWE-943"], owasp: ["A03:2021"],
             location: { url: form.action, snippet: JSON.stringify(probe.body) },
-            evidence: { baseline: { len: baselineLen, status: baselineStatus }, probe: { len: r.body.length, status: r.res.status, redirect: r.redirectChain.length, cookieSet, snippet: truncate(r.body, 300) } },
+            evidence: { baseline: { len: baseResp.body.length, status: baseResp.status, redirect: baselineRedirect, cookieNames: [...baselineCookieNames] }, probe: { len: resp.body.length, status: resp.status, redirect, newAuthCookie, snippet: truncate(r.body, 300) } },
             remediation: "Never trust client-controlled types. Cast username/password to strings before passing to the DB driver. Validate JSON shape with a schema.",
             references: ["https://cheatsheetseries.owasp.org/cheatsheets/Injection_Prevention_in_Java_Cheat_Sheet.html"],
           }));
@@ -454,14 +478,20 @@ export const httpSmugglingScanner: Scanner = {
     // smuggling is plausible.
     const body = await r.text().catch(() => "");
     if (/admin|dashboard|welcome.*admin/i.test(body)) {
+      // INFO only: request smuggling cannot actually be performed over fetch()
+      // (undici normalizes headers and won't emit a desync payload), so this is
+      // at best a hint that the front-end returned admin-shaped content — which
+      // any homepage with an "Admin"/"Dashboard" nav link also does. Emitting
+      // this as high produced guaranteed false positives; a real verdict needs a
+      // raw-socket tool.
       await ctx.emit(draft({
-        severity: "high", confidence: "low",
-        title: "Possible HTTP request smuggling (CL.TE) — admin-shaped content returned to a malformed request",
-        description: "Server returned content suggestive of /admin in response to a body that smuggled a second request line. False positives are possible — confirm with a raw-socket smuggling tool (e.g. smuggler.py).",
+        severity: "info", confidence: "low",
+        title: "HTTP request smuggling: unconfirmed — re-test with a raw-socket tool",
+        description: "The front-end returned admin/dashboard-shaped content to a malformed CL.TE request, but this cannot be confirmed over an HTTP client library. Verify with a raw-socket smuggling tool (e.g. smuggler.py / Burp) before treating it as real.",
         ruleId: "http-smuggling/clte-suspect",
         cwe: ["CWE-444"], owasp: ["A05:2021"],
         location: { url: seed.toString() },
-        evidence: { snippet: truncate(body, 300), status: r.status },
+        evidence: { snippet: truncate(body, 300), status: r.status, note: "cannot be confirmed via fetch/undici" },
         remediation: "Use HTTP/2 end-to-end. Reject ambiguous Content-Length + Transfer-Encoding headers. Patch the front-end proxy.",
         references: ["https://portswigger.net/web-security/request-smuggling"],
       }));
@@ -498,27 +528,35 @@ export const massAssignmentScanner: Scanner = {
       if (ctx.signal.aborted) break;
       const baselineBody = new URLSearchParams();
       for (const i of form.inputs) baselineBody.set(i.name, i.value || "x");
-      let baseline;
-      try { baseline = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: baselineBody.toString(), signal: ctx.signal }); }
-      catch { continue; }
+      // Measure the form's OWN response jitter by submitting it twice unchanged.
+      // A form that embeds a CSRF token / timestamp / reflected count differs
+      // by >50 B between any two POSTs — the old fixed threshold flagged that.
+      const base = await measureBaseline(async () => {
+        try {
+          const r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: baselineBody.toString(), signal: ctx.signal });
+          return { status: r.res.status, body: r.body, latencyMs: 0, redirect: null } as ProbeResp;
+        } catch { return null; }
+      }, 2);
+      if (!base || base.unstable) continue;
 
       const probeBody = new URLSearchParams(baselineBody);
       for (const f of MASS_ASSIGN_FIELDS) probeBody.set(f, "1");
       let probe;
       try { probe = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: probeBody.toString(), signal: ctx.signal }); }
       catch { continue; }
+      if (isNonSignal({ status: probe.res.status, body: probe.body, latencyMs: 0, redirect: null }, base.status)) continue;
 
-      // Heuristic: server accepted the extra fields silently AND response
-      // body changed (some indicator of the extra-field acceptance).
-      if (probe.res.status === baseline.res.status && probe.res.status < 400 && Math.abs(probe.body.length - baseline.body.length) > 50) {
+      // The extra fields "did something" only if the response moved beyond the
+      // form's own jitter while the status held (a hard reject would change it).
+      if (probe.res.status === base.status && exceedsNoise(probe.body.length - base.len, base.jitter)) {
         await ctx.emit(draft({
           severity: "medium", confidence: "low",
           title: `Possible mass assignment on ${form.action}`,
-          description: `POST form accepted ${MASS_ASSIGN_FIELDS.length} extra fields including \`isAdmin\`, \`role\`, \`id\` — server-side might be using whitelist-less object hydration.`,
+          description: `POST form's response shifted beyond its own jitter after adding ${MASS_ASSIGN_FIELDS.length} extra fields including \`isAdmin\`, \`role\`, \`id\` — server-side might be using allowlist-less object hydration. Confirm the privileged field was actually honored.`,
           ruleId: "mass-assignment/extra-fields",
           cwe: ["CWE-915"], owasp: ["A04:2021"],
           location: { url: form.action, snippet: MASS_ASSIGN_FIELDS.join(", ") },
-          evidence: { baselineLen: baseline.body.length, probeLen: probe.body.length, status: probe.res.status, snippet: truncate(probe.body, 300) },
+          evidence: { baselineLen: base.len, jitter: base.jitter, probeLen: probe.body.length, status: probe.res.status, snippet: truncate(probe.body, 300) },
           remediation: "Define an explicit schema/allowlist for accepted fields per endpoint. Don't use `User.update(req.body)` style mass updates.",
           references: ["https://cheatsheetseries.owasp.org/cheatsheets/Mass_Assignment_Cheat_Sheet.html"],
         }));
@@ -566,20 +604,27 @@ export const raceConditionScanner: Scanner = {
             body: body.toString(),
             signal: ctx.signal,
           });
-          return { ok: r.status >= 200 && r.status < 300, status: r.status };
-        } catch { return { ok: false, status: 0 }; }
+          const text = await r.text().catch(() => "");
+          return { ok: r.status >= 200 && r.status < 300, status: r.status, text };
+        } catch { return { ok: false, status: 0, text: "" }; }
       }));
       const ms = Date.now() - t0;
       const successes = results.filter((r) => r.ok).length;
-      if (successes >= 2) {
+      // A race is only meaningful if the endpoint ENFORCES single-use — i.e.
+      // some requests were rejected as duplicate/limit — yet more than one still
+      // slipped through. An endpoint that accepts ALL N is simply idempotent (a
+      // re-votable poll, a like toggle), not a race; flagging that is a false
+      // positive.
+      const limited = results.filter((r) => !r.ok && (r.status === 409 || r.status === 429 || /already|duplicate|limit|exceeded|too\s*many|only\s*once|in\s*use/i.test(r.text))).length;
+      if (successes >= 2 && limited >= 1) {
         await ctx.emit(draft({
           severity: "high", confidence: "low",
-          title: `Possible race condition on ${form.action} — ${successes}/${N} parallel POSTs succeeded`,
-          description: `Sent ${N} parallel POSTs to a transactional-shaped endpoint. ${successes} succeeded — server may not be enforcing atomicity. Combined with state mutation, this enables double-spend / double-vote / coupon-stacking.`,
+          title: `Possible race condition on ${form.action} — ${successes}/${N} parallel POSTs succeeded despite ${limited} rate/duplicate rejection(s)`,
+          description: `Sent ${N} parallel POSTs to a transactional endpoint. ${limited} were rejected as duplicate/limit-exceeded — so the endpoint DOES enforce single-use — yet ${successes} still succeeded, indicating a non-atomic check. Combined with state mutation this enables double-spend / double-vote / coupon-stacking.`,
           ruleId: "race-condition/parallel",
           cwe: ["CWE-362", "CWE-367"], owasp: ["A04:2021"],
           location: { url: form.action },
-          evidence: { successes, total: N, totalMs: ms, statuses: results.map((r) => r.status) },
+          evidence: { successes, limited, total: N, totalMs: ms, statuses: results.map((r) => r.status) },
           remediation: "Wrap the state mutation in an atomic DB transaction with proper SELECT FOR UPDATE / unique-constraint checks. Use idempotency keys for retries.",
           references: ["https://portswigger.net/research/smashing-the-state-machine"],
         }));
@@ -626,7 +671,10 @@ export const sriScanner: Scanner = {
         }
         const src = attrs["src"]; if (!src) continue;
         let abs: URL; try { abs = new URL(src, p.url); } catch { continue; }
-        if (abs.origin === seed.origin) continue; // same-origin = trust
+        // Same-SITE (registrable domain), not same-origin: a site's own CDN
+        // subdomains (cdn./assets./static.example.com) are first-party and must
+        // not be flagged as "third-party".
+        if (sameSite(abs.hostname, seed.hostname)) continue;
         const key = abs.toString();
         const cur = seenScripts.get(key);
         if (cur) { if (!cur.onPages.includes(p.url)) cur.onPages.push(p.url); }
@@ -634,20 +682,23 @@ export const sriScanner: Scanner = {
       }
     }
 
-    for (const [src, info] of seenScripts) {
-      if (info.integrity) continue;
+    // Aggregate into ONE finding — emitting one LOW per script floods the report
+    // (a normal site pulls dozens of cross-site assets).
+    const thirdParty = [...seenScripts.entries()].filter(([, info]) => !info.integrity);
+    if (thirdParty.length) {
+      const hosts = [...new Set(thirdParty.map(([src]) => { try { return new URL(src).host; } catch { return src; } }))];
       await ctx.emit(draft({
         severity: "low", confidence: "high",
-        title: `Third-party script without SRI: ${src}`,
-        description: `Loaded from ${info.onPages.length} page(s) without an \`integrity=\` attribute. If the third-party host is compromised, attackers can serve modified JS to your users.`,
+        title: `${thirdParty.length} cross-site script(s) loaded without Subresource Integrity`,
+        description: `Scripts from other sites are loaded without an \`integrity=\` attribute. If any of these hosts (${hosts.slice(0, 5).join(", ")}${hosts.length > 5 ? ", …" : ""}) is compromised, attackers can serve modified JS to your users. Same-site (own-CDN) scripts are excluded.`,
         ruleId: "sri/missing",
         cwe: ["CWE-353", "CWE-1357"], owasp: ["A08:2021"],
-        location: { url: info.onPages[0], snippet: src },
-        evidence: { src, onPages: info.onPages.slice(0, 5) },
-        remediation: "Compute SHA-384 of the asset, add `integrity=\"sha384-…\" crossorigin=\"anonymous\"` to the tag. Ideally self-host.",
+        location: { url: thirdParty[0][1].onPages[0], snippet: thirdParty[0][0] },
+        evidence: { count: thirdParty.length, hosts, scripts: thirdParty.slice(0, 30).map(([src, info]) => ({ src, onPages: info.onPages.slice(0, 3) })) },
+        remediation: "Add `integrity=\"sha384-…\" crossorigin=\"anonymous\"` to each cross-site <script>, or self-host the asset.",
         references: ["https://developer.mozilla.org/docs/Web/Security/Subresource_Integrity"],
       }));
     }
-    await ctx.progress(1, `${pagesChecked} pages, ${seenScripts.size} third-party scripts`);
+    await ctx.progress(1, `${pagesChecked} pages, ${thirdParty.length} cross-site scripts`);
   },
 };

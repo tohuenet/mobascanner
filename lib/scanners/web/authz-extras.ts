@@ -53,16 +53,25 @@ export const privescScanner: Scanner = {
     const passField = form.inputs.find((i) => i.type === "password")?.name;
     if (!userField || !passField) return;
 
-    // Try a low-priv login first (test/test, guest/guest, demo/demo).
+    // Try a low-priv login. Success must be AFFIRMATIVE — a failed test/test
+    // that 302s back to /login is NOT a login. The old heuristic treated it as
+    // one and then force-browsed as an effectively ANONYMOUS session, flagging
+    // every 200 as privesc.
     const LOW_PRIV = [{ u: "test", p: "test" }, { u: "guest", p: "guest" }, { u: "demo", p: "demo" }];
+    const AUTH_COOKIE = /(sess|sid|auth|token|jwt|login|remember|logged|_session)/i;
     let loggedIn = false;
     for (const cred of LOW_PRIV) {
+      const before = new Set(session.observedSetCookies.map((c) => c.raw.split("=")[0].trim()));
       const body = new URLSearchParams();
       for (const i of form.inputs) body.set(i.name, i.value || "x");
       body.set(userField, cred.u); body.set(passField, cred.p);
       try {
         const r = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: body.toString(), signal: ctx.signal });
-        if (r.redirectChain.length > 0 || /logout|sign\s*out|dashboard|welcome/i.test(r.body)) { loggedIn = true; break; }
+        const newAuthCookie = session.observedSetCookies.map((c) => c.raw.split("=")[0].trim()).some((n) => AUTH_COOKIE.test(n) && !before.has(n));
+        const dest = r.redirectChain.length ? r.redirectChain[r.redirectChain.length - 1] : "";
+        const failed = /invalid|incorrect|wrong|denied|failed/i.test(r.body);
+        const affirmative = !failed && (newAuthCookie || (!!dest && !/login|signin|sign-in|error/i.test(dest) && /logout|sign\s*out|dashboard|welcome|profile/i.test(r.body)));
+        if (affirmative) { loggedIn = true; break; }
       } catch { continue; }
     }
     if (!loggedIn) { await ctx.progress(1, "no low-priv login accepted"); return; }
@@ -74,18 +83,25 @@ export const privescScanner: Scanner = {
       let r;
       try { r = await session.fetch(url, { signal: ctx.signal }); } catch { continue; }
       probed++;
-      if (r.res.status >= 200 && r.res.status < 300 && r.body.length > 200 && !/login|sign\s*in/i.test(r.body)) {
-        await ctx.emit(draft({
-          severity: "high", confidence: "medium",
-          title: `Privilege escalation via force-browse: ${path} reachable as low-priv user`,
-          description: `Logged in as a low-privilege user (test/guest/demo) AND fetched ${path} — server returned HTTP ${r.res.status}. The endpoint should reject non-admin sessions.`,
-          ruleId: "authz/privesc-force-browse",
-          cwe: ["CWE-285", "CWE-863"], owasp: ["A01:2021"],
-          location: { url },
-          evidence: { status: r.res.status, len: r.body.length, snippet: truncate(r.body, 200) },
-          remediation: "Enforce role-based access control on every admin / management route. Don't rely on UI-hiding; enforce server-side.",
-        }));
-      }
+      if (!(r.res.status >= 200 && r.res.status < 300 && r.body.length > 200 && !/login|sign\s*in/i.test(r.body))) continue;
+      // Anonymous baseline: does an UNauthenticated session get the same page?
+      // If so it's public content / a shared SPA shell, not privesc. Only flag
+      // when the low-priv session sees admin content anon does NOT (anon is
+      // blocked, or the body differs materially).
+      let anon; try { anon = await new BrowsingSession(seed.origin).fetch(url, { signal: ctx.signal }); } catch { anon = null; }
+      const anonBlocked = !anon || anon.res.status >= 300 || /login|sign\s*in|denied|forbidden|unauthor/i.test(anon.body);
+      const anonSame = !!anon && Math.abs(anon.body.length - r.body.length) <= Math.max(64, r.body.length * 0.05);
+      if (!anonBlocked && anonSame) continue; // public shell / public content → not privesc
+      await ctx.emit(draft({
+        severity: "high", confidence: "medium",
+        title: `Privilege escalation via force-browse: ${path} reachable as low-priv user`,
+        description: `Logged in as a low-privilege user (test/guest/demo) AND fetched ${path} — server returned HTTP ${r.res.status} with content an anonymous session ${anonBlocked ? "does NOT get (it is blocked)" : "does not get (materially different)"}. The endpoint should reject non-admin sessions.`,
+        ruleId: "authz/privesc-force-browse",
+        cwe: ["CWE-285", "CWE-863"], owasp: ["A01:2021"],
+        location: { url },
+        evidence: { status: r.res.status, len: r.body.length, anonStatus: anon?.res.status ?? null, anonBlocked, snippet: truncate(r.body, 200) },
+        remediation: "Enforce role-based access control on every admin / management route. Don't rely on UI-hiding; enforce server-side.",
+      }));
     }
     await ctx.progress(1, `${probed} admin paths probed`);
   },
@@ -215,9 +231,14 @@ export const replayAttackScanner: Scanner = {
         r2 = await session.fetch(form.action, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: body.toString(), signal: ctx.signal });
       } catch { continue; }
       const both2xx = r1.res.status >= 200 && r1.res.status < 300 && r2.res.status >= 200 && r2.res.status < 300;
-      const noNonceError = !/(duplicate|already|nonce|idempotent|already submitted)/i.test(r2.body);
-      const similarBody = Math.abs(r1.body.length - r2.body.length) < Math.max(50, r1.body.length * 0.1);
-      if (both2xx && noNonceError && similarBody) {
+      const bothNonEmpty = r1.body.length > 0 && r2.body.length > 0;
+      // The second submission must NOT be rejected as a replay — expanded to
+      // cover 409/429 and more phrasings so an endpoint that DOES enforce
+      // idempotency isn't flagged.
+      const replayRejected = r2.res.status === 409 || r2.res.status === 429 ||
+        /(duplicate|already|nonce|idempotent|already\s+submitted|too\s+many|rate\s*limit|expired|token\s+(used|invalid)|invalid\s+request)/i.test(r2.body);
+      const similarBody = Math.abs(r1.body.length - r2.body.length) < Math.max(64, r1.body.length * 0.1);
+      if (both2xx && bothNonEmpty && !replayRejected && similarBody) {
         await ctx.emit(draft({
           severity: "medium", confidence: "low",
           title: `Replay accepted on ${form.action}`,
