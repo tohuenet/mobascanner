@@ -15,7 +15,30 @@
  * Playwright browser context — out of scope for this scaffold.
  */
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { vaultDelete, vaultGet, vaultList, vaultPut } from "../vault/encrypted";
+
+/**
+ * On-disk persistent Chrome profile directory for a login profile. Keeping a
+ * real (persistent) profile — not just a storageState snapshot — means the
+ * login survives across scans AND localStorage / IndexedDB / service-worker
+ * auth works, not only cookies. Lives under the gitignored `data/` tree.
+ */
+export function profileDir(id: string): string {
+  const safe = id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64) || "default";
+  return path.join(process.cwd(), "data", "browser-profiles", safe);
+}
+
+/** True if a persistent Chrome profile has been created for this id. */
+export async function profileDirExists(id: string): Promise<boolean> {
+  try {
+    const st = await fs.stat(profileDir(id));
+    return st.isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 export interface StorageState {
   cookies?: Array<{ name: string; value: string; domain: string; path: string; expires?: number; secure?: boolean; httpOnly?: boolean; sameSite?: string }>;
@@ -65,16 +88,17 @@ export async function listProfiles(): Promise<ProfileSummary[]> {
   return out.sort((a, b) => a.id.localeCompare(b.id));
 }
 
-/** Remove a saved profile. Idempotent. */
+/** Remove a saved profile — both the vault snapshot and its persistent Chrome
+ *  profile directory. Idempotent. */
 export async function deleteProfile(id: string): Promise<void> {
   await vaultDelete(VAULT_PREFIX + id);
+  await fs.rm(profileDir(id), { recursive: true, force: true }).catch(() => undefined);
 }
 
 /** Convert a stored profile into Cookie + extra headers BrowsingSession can use. */
 export async function profileToHeaders(id: string, currentOrigin: string): Promise<Record<string, string>> {
   const state = await loadProfile(id);
   if (!state) return {};
-  const targetOrigin = (() => { try { return new URL(currentOrigin).origin; } catch { return currentOrigin; } })();
   const targetHost = (() => { try { return new URL(currentOrigin).host; } catch { return ""; } })();
 
   const cookies = (state.cookies ?? []).filter((c) => {

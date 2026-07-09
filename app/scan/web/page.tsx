@@ -254,9 +254,17 @@ export default function WebScanPage() {
             <Switch
               checked={liveBrowser}
               onChange={(v) => { setLiveBrowser(v); setCdpTest(null); }}
-              label="Live browser (use my real Chrome)"
-              hint="Attach to a Chrome you launched with --remote-debugging-port so the crawl rides your logged-in session and dodges CAPTCHA / bot walls."
+              label="Live browser — attach to a debug-port Chrome (advanced)"
+              hint="Attach to a Chrome you launched with --remote-debugging-port and are already logged into."
             />
+            {liveBrowser && (
+              <span className="md-body-s" style={{ color: "var(--md-error)" }}>
+                ⚠ The debug port trips Google&apos;s automation block — you can&apos;t
+                sign in to Google in that Chrome. For Google / SSO logins use
+                <b> Authentication → Captured session</b> above (it opens real
+                Chrome with the tells stripped, so login works).
+              </span>
+            )}
             {liveBrowser && (
               <div className="flex flex-col gap-2">
                 <TextField

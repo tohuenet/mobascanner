@@ -149,10 +149,12 @@ export function BrowserCapture({
 
   return (
     <div className="glass-thin p-3 rounded-xl flex flex-col gap-3">
-      <div className="flex items-center gap-2">
+      <div className="flex flex-col gap-1">
         <span className="md-label-l">Capture a new login session</span>
         <span className="md-body-s text-[color:var(--md-on-surface-variant)]">
-          opens Chromium on this machine — only works when self-hosted locally
+          Opens your real Chrome (automation tells stripped) so Google / SSO
+          login works. Log in by hand once — the session is reused for scans.
+          Local self-host only.
         </span>
       </div>
 
@@ -185,7 +187,7 @@ export function BrowserCapture({
 
       {phase.kind === "starting" && (
         <div className="md-body-s text-[color:var(--md-on-surface-variant)]">
-          Spawning Chromium…
+          Opening Chrome…
         </div>
       )}
 
@@ -198,8 +200,8 @@ export function BrowserCapture({
               style={{ background: "var(--md-severity-low)" }}
             />
             <span className="md-body-m">
-              Browser is open — log in inside the Chromium window, then click
-              Save below.
+              Chrome is open — log in inside that window (Google / SSO works),
+              then click Save below.
             </span>
           </div>
           <div className="flex flex-wrap gap-2">
