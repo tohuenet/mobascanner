@@ -1,4 +1,5 @@
 import { ToolsManager } from "@/components/ToolsManager";
+import { DockerToolbox } from "@/components/DockerToolbox";
 
 export const dynamic = "force-dynamic";
 
@@ -9,18 +10,19 @@ export default function ToolsPage() {
         <span className="md-label-l text-[color:var(--md-on-surface-variant)]">environment</span>
         <h1 className="md-display-s mt-1">Tools &amp; installs</h1>
         <p className="md-body-l mt-3 max-w-2xl text-[color:var(--md-on-surface-variant)]">
-          Every scanner that wraps an external CLI is listed here with its live status. The Docker
-          image bakes in the full set, so chips should mostly be green. Anything still <em>missing</em>
-          can be installed in one click — the command runs <strong>inside the running container</strong>,
-          streams its output below, and the chip flips when done. Changes don&apos;t persist across
-          <span className="mono"> docker compose down/up</span> — bake them into the Dockerfile if you
-          want them permanent.
+          Every scanner that wraps an external CLI is listed here with its live status. The fastest way
+          to a <strong>complete</strong> scan is the one-click <em>Full toolbox via Docker</em> below —
+          it builds an image with every tool baked in. Or install anything still <em>missing</em>
+          individually; that command runs <strong>inside the running container</strong>, streams its
+          output, and flips the chip when done.
         </p>
         <p className="md-body-s mt-3 max-w-2xl text-[color:var(--md-on-surface-variant)]">
-          For safety, one-click installs only run a fixed, server-defined command per tool (never
-          free-form input) and are restricted to localhost.
+          For safety, one-click actions only run fixed, server-defined commands (never free-form input)
+          and are restricted to localhost.
         </p>
       </section>
+
+      <DockerToolbox />
 
       <ToolsManager />
     </div>
