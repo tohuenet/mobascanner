@@ -13,6 +13,11 @@
   .err { background: #fef2f2; color: #991b1b; }
 </style></head><body>
 <h1>Send to moba-scanner</h1>
+<p style="font-size:0.82em;color:#555;margin:0 0 10px 0">
+  Log in to the target in THIS tab first (Google / SSO / anything — it's your
+  normal Chrome, so no CAPTCHA). Then capture: the scan runs as the logged-in
+  you, with your real cookies + User-Agent.
+</p>
 <label>moba-scanner URL</label>
 <input id="endpoint" value="http://localhost:3000">
 <label>Preset</label>
@@ -22,7 +27,7 @@
   <option value="pentest-full">Full pentest</option>
   <option value="compliance">Compliance</option>
 </select>
-<button id="capture">Capture this tab + start scan</button>
+<button id="capture">Capture my session + start scan</button>
 <div id="status"></div>
 <script src="popup.js"></script>
 </body></html>

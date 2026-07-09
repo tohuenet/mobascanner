@@ -5,61 +5,76 @@ with bot-detection (Cloudflare, DataDome, hCaptcha/reCAPTCHA) or Google/SSO
 login, that traffic looks automated and gets CAPTCHA'd or blocked with
 "This browser or app may not be secure."
 
-There are two ways to run the scan as the logged-in human. **Prefer Captured
-session** — it's the one that works with Google.
+There are three ways to run the scan as the logged-in human, from most to least
+robust. **If you're fighting Google login or constant CAPTCHA, use the
+extension** — it's the only path with *zero* automation, so there is literally
+nothing for the site to detect, and it works with the app-bound cookie
+encryption in Chrome 127+.
 
 ---
 
-## ✅ Recommended: Captured session (works with Google / SSO)
+## ✅ Best: the companion extension (CAPTCHA-proof)
+
+You log in **normally in your own Chrome** — no debug flags, no automation, no
+`--no-sandbox` — so Google and bot-walls behave exactly as they do for you every
+day. The extension then reads the resulting session via Chrome's trusted
+`chrome.cookies` API and hands it to the scanner.
+
+**Install once:**
+1. Open `chrome://extensions`, turn on **Developer mode** (top-right).
+2. **Load unpacked** → select the `extension/` folder in this repo.
+
+**Use:**
+1. In a normal tab, go to the target and **log in** (Google / SSO / whatever).
+   Solve any CAPTCHA as yourself — it's your real browser.
+2. Click the **moba-scanner** extension → **Capture my session + start scan**.
+3. The scan starts with your real cookies **and** your real User-Agent + client
+   hints, so its requests look like they came from the tab you're logged into.
+
+Nothing about your browser is automated during login, so there is no
+`navigator.webdriver`, no automation flag, no remote-debugging port — the exact
+signals that trip the block are simply absent.
+
+---
+
+## ✅ Convenient: Captured session (real Chrome, log in once)
 
 Scan setup → **Authentication → Captured session → "Open browser to log in"**.
 
-- Opens your **real Google Chrome** (not bundled Chromium) with the automation
-  tells removed (`navigator.webdriver`, `--enable-automation`, the
-  `--remote-debugging-port` flag are all absent) and a persistent profile.
-- **You log in by hand** — Google, SSO, whatever. The tool performs *zero*
-  automation during login, so there's nothing for Google's "not secure" check to
-  detect. Solve any CAPTCHA once, as a human.
-- Click **Save session**. Cookies + localStorage are snapshotted into the
-  encrypted vault, and the Chrome profile persists under
-  `data/browser-profiles/<name>/`.
-- Pick that profile for the scan. Every scanner replays the authenticated
-  session (fetch scanners get the cookies; the JS crawler gets cookies +
-  localStorage, all with a real-Chrome fingerprint + stealth).
+Opens your **real Google Chrome** with the automation tells stripped
+(`navigator.webdriver` gone, sandbox ON so there's no `--no-sandbox` infobar,
+`--enable-automation` removed) and a persistent profile. You log in by hand; the
+tool does nothing during login. Click **Save session**, pick the profile for the
+scan.
 
-Why this works where the debug-port approach fails: Google blocks sign-in
-whenever it detects remote debugging / automation flags. Here the login happens
-in a browser with those tells stripped and **driven by you**, not the tool.
-
-Requires Google Chrome installed and moba-scanner running locally (the window
-opens on the same machine as the server).
+This is Playwright-driven (it launches the window), so on the most aggressive
+detectors it can still be caught where the extension would not. If Google login
+fails here, use the extension.
 
 ---
 
-## ⚠ Advanced: attach to a debug-port Chrome (does NOT work with Google login)
+## ⚠ Advanced: attach to a debug-port Chrome
 
 The `/scan/web` "Live browser" toggle attaches over CDP to a Chrome you launched
-yourself:
-
-```bat
-chrome --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\moba-chrome"
-set MOBA_BROWSER_CDP_URL=http://127.0.0.1:9222   REM or use the toggle's endpoint field
-```
-
-Useful when you already have an authenticated debug Chrome (non-Google auth) and
-want the scan to ride it. **The `--remote-debugging-port` flag trips Google's
-automation block**, so you cannot sign in to Google in that window — log in via
-Captured session instead. Precedence: per-scan `meta.browserCdpUrl` →
-`MOBA_BROWSER_CDP_URL` env. The "Test connection" button reports whether the
-attach works and how many cookies apply to the target.
+with `--remote-debugging-port`. Only for a browser you're **already logged into
+with non-Google auth** — the debug port trips Google's sign-in block. "Test
+connection" reports the attach + cookie count.
 
 ---
 
 ## Safety
 
-- The tool **never closes your browser or tabs** — it closes only what it opened.
-- Captured cookies live in the encrypted vault; the persistent profile lives
-  under the gitignored `data/` tree. Deleting a profile removes both.
+- The tool / extension **never closes your browser or tabs**.
+- Captured cookies ride in the scan's auth headers (extension) or the encrypted
+  vault (Captured session); persistent profiles live under the gitignored
+  `data/` tree. Deleting a profile removes both.
 - Only scan targets you're authorized to test — these modes act as *you*.
-- If anything fails (no Chrome, endpoint unreachable, not logged in), the scan
-  logs a warning and falls back to the anonymous crawl rather than failing.
+- If anything fails, the scan logs a warning and falls back to the anonymous
+  crawl rather than failing.
+
+## Still getting CAPTCHA after the extension?
+
+A few sites fingerprint the TLS/JA3 handshake of every request, which differs
+between Chrome and the scanner's HTTP client even with your cookies. Tell us the
+host — the next step there is proxying the scanner's requests through the very
+Chrome tab you're logged into, so even the TLS fingerprint matches.

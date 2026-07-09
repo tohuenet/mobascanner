@@ -98,6 +98,10 @@ export async function launchStealthPersistent(
     ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT,
     args: STEALTH_ARGS,
     ignoreHTTPSErrors: true,
+    // Keep Chrome's SANDBOX ON. Playwright defaults it off (--no-sandbox), which
+    // pops the yellow "unsupported command-line flag" bar and is itself a strong
+    // bot tell that CAPTCHA / Google sign-in key off.
+    chromiumSandbox: true,
     ...(opts.extraHeaders ? { extraHTTPHeaders: opts.extraHeaders } : {}),
   } satisfies Parameters<typeof chromium.launchPersistentContext>[1];
 
@@ -108,8 +112,13 @@ export async function launchStealthPersistent(
     // Chromium — a far less suspicious fingerprint.
     context = await chromium.launchPersistentContext(userDataDir, { ...base, channel: "chrome" });
   } catch {
+    // Fall back: bundled Chromium, and if the sandbox is what failed, without it.
     usedRealChrome = false;
-    context = await chromium.launchPersistentContext(userDataDir, base);
+    try {
+      context = await chromium.launchPersistentContext(userDataDir, base);
+    } catch {
+      context = await chromium.launchPersistentContext(userDataDir, { ...base, chromiumSandbox: false });
+    }
   }
   await context.addInitScript(STEALTH_INIT_SCRIPT);
   return { context, usedRealChrome };
@@ -165,12 +174,17 @@ export async function acquireBrowser(opts: {
     headless: opts.headless ?? true,
     args: STEALTH_ARGS,
     ignoreDefaultArgs: STEALTH_IGNORE_DEFAULT,
+    chromiumSandbox: true, // no --no-sandbox tell
   };
   let browser: Browser;
   try {
     browser = await chromium.launch({ ...launchOpts, channel: "chrome" });
   } catch {
-    browser = await chromium.launch(launchOpts);
+    try {
+      browser = await chromium.launch(launchOpts);
+    } catch {
+      browser = await chromium.launch({ ...launchOpts, chromiumSandbox: false });
+    }
   }
   return { browser, attached: false, endpoint: null };
 }
